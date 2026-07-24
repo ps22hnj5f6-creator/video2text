@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  video2text:
+    build: .
+    image: video2text:latest
+    ports:
+      - "7860:7860"
+    volumes:
+      - hf_cache:/app/hf_cache       # 模型缓存持久化
+      - ./cookies:/app/cookies        # cookies文件目录
+    environment:
+      - HF_ENDPOINT=https://hf-mirror.com
+      # 腾讯云ASR备用（可选）
+      # - TENCENT_SECRET_ID=your_id
+      # - TENCENT_SECRET_KEY=your_key
+    restart: unless-stopped
+
+volumes:
+  hf_cache:

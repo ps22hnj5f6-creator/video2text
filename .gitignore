@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+models/
+cookies/
+*.egg-info/
+dist/
+build/
+.env
+hf_cache/
+*.wav
+*.mp4
+*.mov
+*.mp3
