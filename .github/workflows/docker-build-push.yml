@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  ACR_REGISTRY: cn-hangzhou.aliyuncs.com
+  ACR_REGISTRY: registry.cn-hangzhou.aliyuncs.com
   ACR_NAMESPACE: video2text
   IMAGE_NAME: video2text
 
