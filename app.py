@@ -102,6 +102,9 @@ class JobManager:
 
 job_manager = JobManager()
 
+# 全局 Timer 引用（在 build_app 中赋值），用于任务结束后停用轮询，避免结果区"跳帧"
+_timer = None
+
 
 # ========== 核心处理逻辑 ==========
 
@@ -138,10 +141,13 @@ def _results_to_state(results: list) -> list[dict]:
     ]
 
 
-def _run_transcription_job(job_id, files, model_size, language, use_deepseek, deepseek_api_key):
-    """在后台线程中执行转写，进度写入 JobManager"""
+def _run_transcription_job(job_id, video_paths, model_size, language, use_deepseek, deepseek_api_key):
+    """在后台线程中执行转写，进度写入 JobManager。
+
+    video_paths 为已复制到应用临时目录的本地路径列表（由 start_upload 在请求存活期内完成复制），
+    避免 Gradio 在前端请求结束后清理临时文件导致后台线程读不到。
+    """
     results = []
-    local_paths = []  # 复制到应用临时目录的文件路径，避免 Gradio 清理后读不到
 
     def update_progress(step, total, desc, done=False):
         job_manager.update(
@@ -153,7 +159,7 @@ def _run_transcription_job(job_id, files, model_size, language, use_deepseek, de
         )
 
     try:
-        if not files:
+        if not video_paths:
             update_progress(0, 1, "请上传至少一个视频文件", done=True)
             job_manager.set_done(job_id, [])
             return
@@ -163,24 +169,6 @@ def _run_transcription_job(job_id, files, model_size, language, use_deepseek, de
         state.language = language
         if need_reload:
             state.transcriber = None
-
-        if isinstance(files, list):
-            video_paths = [f if isinstance(f, str) else getattr(f, 'name', str(f)) for f in files]
-        elif isinstance(files, str):
-            video_paths = [files]
-        else:
-            video_paths = [getattr(files, 'name', str(files))]
-
-        # Gradio 上传的临时文件会在前端请求结束后被清理，后台线程必须复制到本地再处理
-        for p in video_paths:
-            try:
-                dest = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{Path(p).name}")
-                shutil.copy2(p, dest)
-                local_paths.append(dest)
-            except Exception as copy_err:
-                print(f"[WARN] 复制上传文件失败 {p}: {copy_err}")
-                local_paths.append(p)  # fallback，后续让 ffmpeg/whisper 给出更明确错误
-        video_paths = local_paths
 
         titles = [Path(p).stem for p in video_paths]
         total_files = len(video_paths)
@@ -276,7 +264,7 @@ def _run_transcription_job(job_id, files, model_size, language, use_deepseek, de
 
     finally:
         # 清理复制到本地临时目录的视频副本
-        for p in local_paths:
+        for p in video_paths:
             try:
                 if os.path.exists(p):
                     os.unlink(p)
@@ -286,10 +274,40 @@ def _run_transcription_job(job_id, files, model_size, language, use_deepseek, de
 
 def start_upload(files, model_size, language, use_deepseek, deepseek_api_key):
     """启动后台转写任务，返回 job_id"""
+    # 重新激活轮询 Timer（上一次任务结束后会被停用，避免结果区跳帧）
+    if _timer is not None:
+        _timer.active = True
+
+    # 在请求还活着时就把 Gradio 临时文件复制到应用临时目录，
+    # 否则请求结束 Gradio 清理后，后台线程将读不到文件（批量上传尤其容易踩）
+    video_paths = []
+    if files:
+        def resolve_file_path(f):
+            if isinstance(f, str):
+                return f
+            if isinstance(f, dict):
+                return f.get("path") or f.get("name") or f.get("orig_name") or str(f)
+            for attr in ("name", "path", "orig_name"):
+                v = getattr(f, attr, None)
+                if isinstance(v, str):
+                    return v
+            return str(f)
+
+        raw = files if isinstance(files, list) else [files]
+        for f in raw:
+            p = resolve_file_path(f)
+            try:
+                dest = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{Path(p).name}")
+                shutil.copy2(p, dest)
+                video_paths.append(dest)
+            except Exception as e:
+                print(f"[WARN] 复制上传文件失败 {p}: {e}")
+                video_paths.append(p)
+
     job_id = job_manager.create()
     thread = threading.Thread(
         target=_run_transcription_job,
-        args=(job_id, files, model_size, language, use_deepseek, deepseek_api_key),
+        args=(job_id, video_paths, model_size, language, use_deepseek, deepseek_api_key),
         daemon=True,
     )
     thread.start()
@@ -320,6 +338,14 @@ def check_status(job_id):
     progress_html = job.get("progress_html") or _progress_html(
         job.get("step", 0), job.get("total", 1), job.get("desc", "处理中..."), job.get("done", False)
     )
+
+    if job.get("error") or job.get("done"):
+        # 只渲染一次最终结果，之后停掉 Timer，避免每2秒重渲染导致"跳帧"
+        if job.get("rendered"):
+            return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+        job_manager.update(job_id, rendered=True)
+        if _timer is not None:
+            _timer.active = False
 
     if job.get("error"):
         return progress_html, job.get("results", []), progress_html, "", None
@@ -898,6 +924,8 @@ def build_app():
         # 2) 定时轮询：每 2 秒查询一次后台任务进度与结果
         # Gradio 4.x Timer 参数名为 value（间隔秒数），不是 every
         timer = gr.Timer(value=2.0, active=True)
+        global _timer
+        _timer = timer
         timer.tick(
             fn=check_status,
             inputs=[job_id_state],
