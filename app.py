@@ -759,6 +759,10 @@ def build_app():
     with gr.Blocks(
         title="短视频批量转文字",
         fill_width=False,
+        theme=gr.themes.Soft(
+            primary_hue="indigo",
+            secondary_hue="slate",
+        ),
     ) as app:
 
         # 居中外层容器
@@ -905,9 +909,5 @@ if __name__ == "__main__":
         share=False,
         inbrowser=False,
         show_error=True,
-        theme=gr.themes.Soft(
-            primary_hue="indigo",
-            secondary_hue="slate",
-        ),
         css=CUSTOM_CSS,
     )
