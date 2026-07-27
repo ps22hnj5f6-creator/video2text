@@ -123,13 +123,20 @@ def _progress_html(step: int, total: int, desc: str, done: bool = False) -> str:
     """
 
 
-def _upload_progress_html(file_count: int, total_bytes: int, errors: int = 0) -> str:
+def _upload_progress_html(
+    file_count: int,
+    total_bytes: int,
+    errors: int = 0,
+    error_msg: str | None = None,
+) -> str:
     """渲染上传完成后的进度条 HTML（文件已上传到 Gradio 临时目录后触发复制）"""
     mb = total_bytes / (1024 * 1024)
     pct = 100 if file_count > 0 else 0
     bar_color = "#22c55e" if file_count > 0 else "#94a3b8"
     error_html = ""
-    if errors:
+    if error_msg:
+        error_html = f'<div style="color:#dc2626;font-size:12px;margin-top:6px;">⚠️ {error_msg}</div>'
+    elif errors:
         error_html = f'<div style="color:#dc2626;font-size:12px;margin-top:6px;">⚠️ {errors} 个文件复制失败，请重新上传</div>'
     return f"""
     <div class="v2t-progress">
@@ -173,6 +180,16 @@ def _cleanup_copies(items: list[dict], keep_paths: list[str] | None = None):
                 pass
 
 
+def _copy_file_chunked(src: str, dst: str, chunk_size: int = 1024 * 1024):
+    """分块复制文件，避免一次性加载大文件到内存"""
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        shutil.copyfileobj(fsrc, fdst, chunk_size)
+
+
+# 单次上传总大小限制（MB），超过时给出友好提示，避免网关/内存问题
+MAX_UPLOAD_TOTAL_MB = 500
+
+
 def on_files_change(files, current_items: list[dict]) -> tuple[str, list[dict]]:
     """文件上传完成时立即复制到应用临时目录，避免请求结束后 Gradio 清理临时文件。
 
@@ -186,6 +203,18 @@ def on_files_change(files, current_items: list[dict]) -> tuple[str, list[dict]]:
     raw_files = files if isinstance(files, list) else [files]
     new_origs = [_resolve_file_path(f) for f in raw_files]
 
+    # 检查总大小，避免触发网关/容器内存问题
+    existing_origs = [p for p in new_origs if os.path.exists(p)]
+    total_input_bytes = sum(os.path.getsize(p) for p in existing_origs)
+    print(
+        f"[UPLOAD] change event: {len(new_origs)} file(s), "
+        f"total {total_input_bytes / (1024 * 1024):.1f} MB"
+    )
+    if total_input_bytes > MAX_UPLOAD_TOTAL_MB * 1024 * 1024:
+        err_msg = f"单次上传总大小超过 {MAX_UPLOAD_TOTAL_MB} MB 限制，请分批上传或减少文件大小"
+        print(f"[UPLOAD] {err_msg}")
+        return _upload_progress_html(0, total_input_bytes, error_msg=err_msg), current_items
+
     # 保留仍存在的旧副本，避免重复复制
     old_map = {item["orig"]: item.get("copy") for item in current_items if item.get("copy")}
     new_items: list[dict] = []
@@ -196,8 +225,9 @@ def on_files_change(files, current_items: list[dict]) -> tuple[str, list[dict]]:
         else:
             try:
                 dest = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{Path(orig).name}")
-                shutil.copy2(orig, dest)
+                _copy_file_chunked(orig, dest)
                 new_items.append({"orig": orig, "copy": dest})
+                print(f"[UPLOAD] copied {Path(orig).name} -> {dest}")
             except Exception as e:
                 print(f"[WARN] 复制上传文件失败 {orig}: {e}")
                 traceback.print_exc()
