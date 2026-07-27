@@ -351,11 +351,14 @@ def generate_export_excel(results: list) -> str:
 def export_txt_from_state():
     return generate_export_txt(state.results)
 
+
 def export_json_from_state():
     return generate_export_json(state.results)
 
+
 def export_excel_from_state():
     return generate_export_excel(state.results)
+
 
 def clear_results():
     state.results = []
@@ -364,89 +367,253 @@ def clear_results():
 
 # ========== Gradio 界面 ==========
 
+# 界面文案常量
+HEADER_MD = """
+<div style="text-align:center; margin-bottom:8px;">
+    <h1 style="margin:0; font-size:32px; font-weight:700;">🎬 短视频批量转文字</h1>
+    <p style="margin:8px 0 0; color:#666; font-size:15px;">
+        上传短视频或粘贴分享链接，自动提取语音转写为文字。支持抖音、视频号等平台。
+    </p>
+    <p style="margin:4px 0 0; color:#999; font-size:13px;">
+        视频时长建议 ≤ 90 秒，更长视频也能处理但耗时增加。
+    </p>
+</div>
+"""
+
+LINK_HINT_MD = """
+<div style="background:#fff7ed; border:1px solid #fed7aa; border-radius:8px; padding:12px 16px; margin:8px 0 16px;">
+    <p style="margin:0 0 6px; color:#9a3412; font-weight:600;">📌 粘贴说明</p>
+    <p style="margin:0 0 4px; color:#7c2d12; font-size:13px;">
+        每行一个链接，可直接粘贴抖音/视频号完整的分享文本，系统会自动提取链接。
+    </p>
+    <p style="margin:0; color:#c2410c; font-size:13px;">
+        ⚠️ <b>抖音、视频号必须配置 cookies 才能下载</b>，请见下方「Cookies 配置」。
+    </p>
+</div>
+"""
+
+COOKIE_HELP_MD = """
+<div style="background:#f0f9ff; border:1px solid #bae6fd; border-radius:8px; padding:12px 16px; margin-top:8px;">
+    <p style="margin:0 0 8px; color:#075985; font-weight:600;">🍪 如何获取 Cookies</p>
+    <ol style="margin:0; padding-left:20px; color:#0c4a6e; font-size:13px; line-height:1.8;">
+        <li>用 Chrome/Edge 浏览器登录抖音（或视频号）网页版</li>
+        <li>安装浏览器插件 <b>Get cookies.txt LOCALLY</b></li>
+        <li>在抖音页面点击插件，导出为 <b>Netscape 格式</b> 的 cookies.txt 文件</li>
+        <li>将文件路径填入下方输入框（线上部署时建议先上传到容器可访问路径）</li>
+    </ol>
+</div>
+"""
+
+FAQ_MD = """
+### 支持的平台
+- 抖音（需 cookies）
+- 微信视频号（需 cookies）
+- B站、YouTube、微博等 yt-dlp 支持的所有平台
+
+### 性能参考
+| 模型 | 内存占用 | 90s视频转写耗时(CPU) | 中文准确率 |
+|------|---------|---------------------|----------|
+| tiny | ~1GB | ~15s | ~70% |
+| base | ~1GB | ~30s | ~85% |
+| small | ~2GB | ~60s | ~92% |
+| large-v3 | ~3GB | ~180s | ~97% |
+
+### 注意事项
+- 首次运行会自动下载模型文件（base约74MB），后续不再重复下载
+- CPU模式足够应对90s短视频，GPU可加速4-10倍
+- 证券金融术语建议用 base 或以上模型，tiny容易出错
+- 如需更高准确率，可后续切换到腾讯云ASR引擎
+"""
+
+CUSTOM_CSS = """
+/* 整体页面背景与内边距 */
+.gradio-container {
+    background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%) !important;
+    padding: 24px 16px 48px !important;
+    display: flex !important;
+    justify-content: center !important;
+}
+
+/* Gradio 6.x 主内容包裹层 */
+.gradio-container > .main {
+    width: 100% !important;
+    max-width: 1000px !important;
+    display: flex !important;
+    justify-content: center !important;
+}
+
+/* 主内容区最大宽度并居中 */
+.app-wrap {
+    width: 100% !important;
+    max-width: 1000px !important;
+    margin: 0 auto !important;
+}
+
+/* 标题区卡片 */
+.header-card {
+    background: #ffffff;
+    border-radius: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    padding: 28px 24px;
+    margin-bottom: 20px;
+    text-align: center;
+}
+
+/* Tab 容器卡片 */
+.main-card {
+    background: #ffffff;
+    border-radius: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    padding: 24px;
+    margin-bottom: 20px;
+}
+
+/* 结果区卡片 */
+.result-card {
+    background: #ffffff;
+    border-radius: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    padding: 24px;
+    margin-bottom: 20px;
+}
+
+/* 按钮区域 */
+.btn-row {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+/* 主按钮 */
+.primary-btn {
+    min-width: 180px;
+}
+
+/* 表格滚动 */
+.result-table-wrap {
+    overflow-x: auto;
+}
+
+/* 配置区紧凑 */
+.config-row {
+    margin-bottom: 8px !important;
+}
+
+/* 移动端适配 */
+@media (max-width: 768px) {
+    .gradio-container {
+        padding: 12px 8px 32px !important;
+    }
+    .header-card, .main-card, .result-card {
+        padding: 16px;
+        border-radius: 12px;
+    }
+    .primary-btn {
+        min-width: 100%;
+    }
+}
+"""
+
+
 def build_app():
-    with gr.Blocks(title="短视频批量转文字") as app:
+    with gr.Blocks(
+        title="短视频批量转文字",
+        fill_width=False,
+    ) as app:
 
-        gr.Markdown(
-            "# 🎬 短视频批量转文字\n"
-            "上传短视频或粘贴分享链接，自动提取语音转写为文字。支持抖音、视频号等平台。\n"
-            "视频时长建议 ≤ 90 秒，更长视频也能处理但耗时增加。"
-        )
+        # 居中外层容器
+        with gr.Column(elem_classes="app-wrap"):
 
-        # 配置区
-        with gr.Row():
-            model_size = gr.Dropdown(
-                choices=["tiny", "base", "small", "medium", "large-v3"],
-                value="base",
-                label="模型大小",
-                info="tiny最快但最差，base性价比最佳（推荐），large-v3最准但最慢"
-            )
-            language = gr.Dropdown(
-                choices=["zh", "en", "ja", "ko", "auto"],
-                value="zh",
-                label="语言",
-                info="zh=中文, en=英文, auto=自动检测（稍慢）"
-            )
+            # 标题
+            with gr.Column(elem_classes="header-card"):
+                gr.Markdown(HEADER_MD)
 
-        # 本地上传 Tab
-        with gr.Tab("📁 本地上传"):
-            file_input = gr.File(
-                label="上传短视频",
-                file_count="multiple",
-                file_types=[".mp4", ".mov", ".avi", ".webm", ".mkv", ".flv", ".3gp"],
-                type="filepath"
-            )
-            upload_btn = gr.Button("🚀 开始转写", variant="primary", size="lg")
-
-        # 链接下载 Tab
-        with gr.Tab("🔗 链接下载"):
-            gr.Markdown(
-                "粘贴视频分享文本或链接（每行一个），支持抖音短链接、视频号链接等。\n\n"
-                "抖音示例：`7.47 Dhi:/ 复制打开抖音... https://v.douyin.com/iRNBd6s/`\n\n"
-                "⚠️ 抖音/视频号下载可能需要 cookies，详见下方说明。"
-            )
-            link_input = gr.Textbox(
-                label="粘贴分享文本/链接",
-                placeholder="每行一个链接，或直接粘贴完整的分享文本...",
-                lines=5,
-            )
-            link_btn = gr.Button("🚀 下载并转写", variant="primary", size="lg")
-
-            with gr.Accordion("Cookies 配置（部分平台需要）", open=False):
-                gr.Markdown(
-                    "抖音等平台需要登录态才能下载视频。获取方法：\n"
-                    "1. 用浏览器登录抖音\n"
-                    "2. 安装浏览器插件 'Get cookies.txt LOCALLY'\n"
-                    "3. 导出 cookies 为 Netscape 格式文件\n"
-                    "4. 将文件路径填入下方"
+            # 配置区
+            with gr.Row(equal_height=True, elem_classes="config-row"):
+                model_size = gr.Dropdown(
+                    choices=["tiny", "base", "small", "medium", "large-v3"],
+                    value="base",
+                    label="模型大小",
+                    info="tiny最快但最差，base性价比最佳（推荐），large-v3最准但最慢"
                 )
-                cookie_file = gr.Textbox(
-                    label="Cookies 文件路径",
-                    placeholder="/path/to/cookies.txt",
-                    value=""
+                language = gr.Dropdown(
+                    choices=["zh", "en", "ja", "ko", "auto"],
+                    value="zh",
+                    label="语言",
+                    info="zh=中文, en=英文, auto=自动检测（稍慢）"
                 )
 
-        # 结果区
-        gr.Markdown("## 📋 转写结果")
+            # Tab 主功能区
+            with gr.Column(elem_classes="main-card"):
+                with gr.Tabs():
+                    # 本地上传 Tab
+                    with gr.Tab("📁 本地上传"):
+                        file_input = gr.File(
+                            label="上传短视频",
+                            file_count="multiple",
+                            file_types=[".mp4", ".mov", ".avi", ".webm", ".mkv", ".flv", ".3gp"],
+                            type="filepath"
+                        )
+                        upload_btn = gr.Button(
+                            "🚀 开始转写",
+                            variant="primary",
+                            size="lg",
+                            elem_classes="primary-btn"
+                        )
 
-        result_table = gr.HTML(
-            value="<p>暂无结果，请上传视频或粘贴链接</p>",
-        )
+                    # 链接下载 Tab
+                    with gr.Tab("🔗 链接下载"):
+                        gr.Markdown(LINK_HINT_MD)
+                        link_input = gr.Textbox(
+                            label="粘贴分享文本 / 链接",
+                            placeholder="每行一个链接，或直接粘贴完整的分享文本...",
+                            lines=5,
+                        )
+                        link_btn = gr.Button(
+                            "🚀 下载并转写",
+                            variant="primary",
+                            size="lg",
+                            elem_classes="primary-btn"
+                        )
 
-        result_text = gr.Textbox(
-            label="纯文本结果（可复制）",
-            value="",
-            lines=10,
-        )
+                        with gr.Accordion("🍪 Cookies 配置（抖音/视频号必需）", open=False):
+                            gr.Markdown(COOKIE_HELP_MD)
+                            cookie_file = gr.Textbox(
+                                label="Cookies 文件路径",
+                                placeholder="/path/to/cookies.txt",
+                                value=""
+                            )
 
-        # 导出区
-        with gr.Row():
-            export_txt_btn = gr.Button("📄 导出 TXT")
-            export_json_btn = gr.Button("📦 导出 JSON")
-            export_excel_btn = gr.Button("📊 导出 Excel")
-            clear_btn = gr.Button("🗑️ 清空结果", variant="secondary")
+            # 结果区
+            with gr.Column(elem_classes="result-card"):
+                gr.Markdown("## 📋 转写结果")
 
-        export_file = gr.File(label="导出文件")
+                result_table = gr.HTML(
+                    value="<p style='color:#888; text-align:center; padding:20px;'>暂无结果，请上传视频或粘贴链接</p>",
+                    elem_classes="result-table-wrap"
+                )
+
+                result_text = gr.Textbox(
+                    label="纯文本结果（可复制）",
+                    value="",
+                    lines=10,
+                )
+
+                # 导出区
+                with gr.Row(elem_classes="btn-row"):
+                    export_txt_btn = gr.Button("📄 导出 TXT")
+                    export_json_btn = gr.Button("📦 导出 JSON")
+                    export_excel_btn = gr.Button("📊 导出 Excel")
+                    clear_btn = gr.Button("🗑️ 清空结果", variant="secondary")
+
+                export_file = gr.File(label="导出文件")
+
+            # 使用说明
+            with gr.Column(elem_classes="main-card"):
+                with gr.Accordion("📖 使用说明 & FAQ", open=False):
+                    gr.Markdown(FAQ_MD)
 
         # 事件绑定
         upload_btn.click(
@@ -470,27 +637,6 @@ def build_app():
             outputs=[result_table, result_text, export_file]
         )
 
-        # 使用说明
-        with gr.Accordion("使用说明 & FAQ", open=False):
-            gr.Markdown(
-                "### 支持的平台\n"
-                "- 抖音（需 cookies）\n"
-                "- 微信视频号（需 cookies）\n"
-                "- B站、YouTube、微博等 yt-dlp 支持的所有平台\n\n"
-                "### 性能参考\n"
-                "| 模型 | 内存占用 | 90s视频转写耗时(CPU) | 中文准确率 |\n"
-                "|------|---------|---------------------|----------|\n"
-                "| tiny | ~1GB | ~15s | ~70% |\n"
-                "| base | ~1GB | ~30s | ~85% |\n"
-                "| small | ~2GB | ~60s | ~92% |\n"
-                "| large-v3 | ~3GB | ~180s | ~97% |\n\n"
-                "### 注意事项\n"
-                "- 首次运行会自动下载模型文件（base约74MB），后续不再重复下载\n"
-                "- CPU模式足够应对90s短视频，GPU可加速4-10倍\n"
-                "- 证券金融术语建议用 base 或以上模型，tiny容易出错\n"
-                "- 如需更高准确率，可后续切换到腾讯云ASR引擎"
-            )
-
     return app
 
 
@@ -502,8 +648,11 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=7860,
         share=False,
-        inbrowser=True,
+        inbrowser=False,
         show_error=True,
-        theme=gr.themes.Soft(),
-        css=".contain { max-width: 1200px; margin: auto; } .result-box { min-height: 200px; }"
+        theme=gr.themes.Soft(
+            primary_hue="indigo",
+            secondary_hue="slate",
+        ),
+        css=CUSTOM_CSS,
     )
