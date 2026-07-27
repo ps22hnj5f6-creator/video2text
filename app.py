@@ -3,8 +3,11 @@
 
 import os
 import json
+import time
+import uuid
 import traceback
 import tempfile
+import threading
 from pathlib import Path
 
 # HuggingFace 国内镜像（解决 SSL/被墙问题）
@@ -42,6 +45,63 @@ TEMP_DIR = tempfile.mkdtemp(prefix="v2t_app_")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 
+# ========== 后台任务管理（避免 WebSocket 被网关切断） ==========
+
+class JobManager:
+    """线程安全的后台任务管理器"""
+    def __init__(self, max_jobs: int = 50):
+        self._lock = threading.Lock()
+        self._jobs: dict[str, dict] = {}
+        self._max_jobs = max_jobs
+
+    def create(self) -> str:
+        job_id = str(uuid.uuid4())
+        with self._lock:
+            if len(self._jobs) > self._max_jobs:
+                self._cleanup()
+            self._jobs[job_id] = {
+                "created_at": time.time(),
+                "status": "pending",
+                "step": 0,
+                "total": 1,
+                "desc": "等待开始...",
+                "results": [],
+                "done": False,
+                "error": None,
+            }
+        return job_id
+
+    def update(self, job_id: str, **kwargs):
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.update(kwargs)
+
+    def get(self, job_id: str) -> dict | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job.copy() if job else None
+
+    def set_done(self, job_id: str, results: list, error: str | None = None):
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job["results"] = results
+                job["error"] = error
+                job["done"] = True
+                job["status"] = "error" if error else "done"
+
+    def _cleanup(self):
+        """清理超过 2 小时的旧任务"""
+        now = time.time()
+        expired = [jid for jid, job in self._jobs.items() if now - job["created_at"] > 7200]
+        for jid in expired:
+            self._jobs.pop(jid, None)
+
+
+job_manager = JobManager()
+
+
 # ========== 核心处理逻辑 ==========
 
 def _progress_html(step: int, total: int, desc: str, done: bool = False) -> str:
@@ -77,12 +137,23 @@ def _results_to_state(results: list) -> list[dict]:
     ]
 
 
-def process_uploaded_files_streaming(files, model_size, language, use_deepseek, deepseek_api_key):
-    """处理本地上传的视频文件（流式返回状态，只渲染一条进度条）"""
+def _run_transcription_job(job_id, files, model_size, language, use_deepseek, deepseek_api_key):
+    """在后台线程中执行转写，进度写入 JobManager"""
     results = []
+
+    def update_progress(step, total, desc, done=False):
+        job_manager.update(
+            job_id,
+            step=step,
+            total=total,
+            desc=desc,
+            progress_html=_progress_html(step, total, desc, done=done),
+        )
+
     try:
         if not files:
-            yield _progress_html(0, 1, "请上传至少一个视频文件", done=True), []
+            update_progress(0, 1, "请上传至少一个视频文件", done=True)
+            job_manager.set_done(job_id, [])
             return
 
         need_reload = (state.model_size != model_size or state.language != language)
@@ -104,12 +175,10 @@ def process_uploaded_files_streaming(files, model_size, language, use_deepseek, 
         deepseek_step = 1 if use_deepseek else 0
         total_steps = total_files * 3 + model_load_step + deepseek_step
 
-        # 准备阶段
-        yield _progress_html(0, total_steps, "正在准备..."), _results_to_state(results)
+        update_progress(0, total_steps, "正在准备...")
 
-        # 首次加载模型
         if model_load_step:
-            yield _progress_html(1, total_steps, "正在加载 Whisper 模型（首次需下载）..."), _results_to_state(results)
+            update_progress(1, total_steps, "正在加载 Whisper 模型（首次需下载）...")
 
         transcriber = state.get_transcriber()
 
@@ -117,14 +186,14 @@ def process_uploaded_files_streaming(files, model_size, language, use_deepseek, 
         for i, (path, title) in enumerate(zip(video_paths, titles)):
             r = TranscriptResult(source=path, title=title)
 
-            yield _progress_html(current, total_steps, f"[{i+1}/{total_files}] 提取音频: {title}"), _results_to_state(results)
+            update_progress(current, total_steps, f"[{i+1}/{total_files}] 提取音频: {title}")
             current += 1
 
             try:
                 audio_path, duration = transcriber.prepare_audio(path)
                 r.duration = duration
 
-                yield _progress_html(current, total_steps, f"[{i+1}/{total_files}] 正在转写: {title}"), _results_to_state(results)
+                update_progress(current, total_steps, f"[{i+1}/{total_files}] 正在转写: {title}")
                 current += 1
 
                 full_text, segment_list = transcriber.transcribe_audio(audio_path)
@@ -136,22 +205,24 @@ def process_uploaded_files_streaming(files, model_size, language, use_deepseek, 
                 except OSError:
                     pass
 
-                yield _progress_html(current, total_steps, f"[{i+1}/{total_files}] ✅ 完成: {title}"), _results_to_state(results)
+                update_progress(current, total_steps, f"[{i+1}/{total_files}] ✅ 完成: {title}")
                 current += 1
 
             except Exception as e:
                 r.error = str(e)
                 current += 2
-                yield _progress_html(
+                update_progress(
                     min(current, total_steps), total_steps,
                     f"[{i+1}/{total_files}] ❌ 失败: {title} — {e}"
-                ), _results_to_state(results)
+                )
 
             results.append(r)
+            # 同步到全局 state，方便导出按钮直接使用
             state.results = results
+            job_manager.update(job_id, results=_results_to_state(results))
 
         if use_deepseek:
-            yield _progress_html(current, total_steps, "🧹 DeepSeek 正在清理重复与错词..."), _results_to_state(results)
+            update_progress(current, total_steps, "🧹 DeepSeek 正在清理重复与错词...")
             current += 1
 
             api_key = (deepseek_api_key or "").strip()
@@ -165,33 +236,84 @@ def process_uploaded_files_streaming(files, model_size, language, use_deepseek, 
                             for seg in r.segments:
                                 seg["text"] = r.text
                     state.results = results
+                    job_manager.update(job_id, results=_results_to_state(results))
                 except Exception as e:
                     err_msg = f"DeepSeek 后处理失败: {e}"
                     print(f"[WARN] {err_msg}")
                     traceback.print_exc()
-                    yield _progress_html(total_steps, total_steps, f"⚠️ {err_msg}", done=True), _results_to_state(results)
+                    update_progress(total_steps, total_steps, f"⚠️ {err_msg}", done=True)
+                    job_manager.set_done(job_id, _results_to_state(results), error=err_msg)
                     return
             else:
-                yield _progress_html(
+                update_progress(
                     total_steps, total_steps,
                     "⚠️ 已启用 DeepSeek 但 API key 为空（未设置 DEEPSEEK_API_KEY）",
                     done=True
-                ), _results_to_state(results)
+                )
+                job_manager.set_done(job_id, _results_to_state(results), error="DeepSeek API key 为空")
                 return
 
-        yield _progress_html(total_steps, total_steps, "✅ 全部完成！", done=True), _results_to_state(results)
+        update_progress(total_steps, total_steps, "✅ 全部完成！", done=True)
+        job_manager.set_done(job_id, _results_to_state(results))
 
     except Exception as e:
         traceback.print_exc()
-        yield _progress_html(0, 1, f"❌ 处理出错: {e}", done=True), _results_to_state(results)
+        update_progress(0, 1, f"❌ 处理出错: {e}", done=True)
+        job_manager.set_done(job_id, _results_to_state(results), error=str(e))
 
 
-def render_results(_state_data):
-    """根据 state.results 渲染最终结果区（由 .then() 调用）"""
-    results = state.results
-    if not results:
-        return "<p style='color:#888; text-align:center; padding:20px;'>暂无结果</p>", "", None
-    return format_results_table(results), format_results_text(results), generate_export_json(results)
+def start_upload(files, model_size, language, use_deepseek, deepseek_api_key):
+    """启动后台转写任务，返回 job_id"""
+    job_id = job_manager.create()
+    thread = threading.Thread(
+        target=_run_transcription_job,
+        args=(job_id, files, model_size, language, use_deepseek, deepseek_api_key),
+        daemon=True,
+    )
+    thread.start()
+    return job_id
+
+
+def check_status(job_id):
+    """定时轮询任务状态（短 HTTP 请求，不会被网关切断）"""
+    if not job_id:
+        return (
+            "<p style='color:#888; text-align:center; padding:12px;'>点击「开始转写」后在此显示进度</p>",
+            [],
+            "<p style='color:#888; text-align:center; padding:20px;'>暂无结果，请上传视频文件</p>",
+            "",
+            None,
+        )
+
+    job = job_manager.get(job_id)
+    if job is None:
+        return (
+            "<p style='color:#888; text-align:center; padding:12px;'>任务不存在或已过期</p>",
+            [],
+            "<p style='color:#888; text-align:center; padding:20px;'>暂无结果</p>",
+            "",
+            None,
+        )
+
+    progress_html = job.get("progress_html") or _progress_html(
+        job.get("step", 0), job.get("total", 1), job.get("desc", "处理中..."), job.get("done", False)
+    )
+
+    if job.get("error"):
+        return progress_html, job.get("results", []), progress_html, "", None
+
+    if job.get("done"):
+        results = [TranscriptResult(**r) for r in job.get("results", [])]
+        return (
+            progress_html,
+            job.get("results", []),
+            format_results_table(results),
+            format_results_text(results),
+            generate_export_json(results),
+        )
+
+    # 未完成：只更新进度，结果区保持原样
+    return progress_html, job.get("results", []), gr.update(), gr.update(), gr.update()
 
 
 # ========== 结果格式化 ==========
@@ -708,8 +830,9 @@ def build_app():
                     value="<p style='color:#888; text-align:center; padding:12px;'>点击「开始转写」后在此显示进度</p>",
                     elem_classes="status-box"
                 )
-                # 隐藏状态，用于触发最终渲染
+                # 隐藏状态
                 results_state = gr.State(value=[])
+                job_id_state = gr.State(value="")
 
                 result_table = gr.HTML(
                     value="<p style='color:#888; text-align:center; padding:20px;'>暂无结果，请上传视频文件</p>",
@@ -737,16 +860,20 @@ def build_app():
                     gr.Markdown(FAQ_MD)
 
         # 事件绑定
-        # 流式处理：只更新单一状态区，隐藏 Gradio 默认的多输出进度条
+        # 1) 点击开始：启动后台线程，立即返回 job_id（短请求，不会被网关切断）
         upload_btn.click(
-            fn=process_uploaded_files_streaming,
+            fn=start_upload,
             inputs=[file_input, model_size, language, use_deepseek, deepseek_api_key],
-            outputs=[status_box, results_state],
+            outputs=[job_id_state],
             show_progress="hidden",
-        ).then(
-            fn=render_results,
-            inputs=[results_state],
-            outputs=[result_table, result_text, export_file]
+        )
+
+        # 2) 定时轮询：每 2 秒查询一次后台任务进度与结果
+        timer = gr.Timer(every=2.0, active=True)
+        timer.tick(
+            fn=check_status,
+            inputs=[job_id_state],
+            outputs=[status_box, results_state, result_table, result_text, export_file]
         )
 
         export_txt_btn.click(fn=export_txt_from_state, outputs=export_file)
@@ -756,6 +883,9 @@ def build_app():
         clear_btn.click(
             fn=clear_results,
             outputs=[result_table, result_text, export_file, status_box]
+        ).then(
+            fn=lambda: "",
+            outputs=[job_id_state]
         )
 
     return app
@@ -765,12 +895,8 @@ def build_app():
 
 if __name__ == "__main__":
     app = build_app()
-    # 启用队列：长转写任务用持久连接，避免代理/负载均衡超时断开
-    app.queue(
-        default_concurrency_limit=1,
-        max_size=20,
-        status_update_rate="auto",
-    )
+    # 注意：不使用 queue()/WebSocket，避免 Sealos 等网关不支持 WebSocket 导致 503
+    # 转写改为后台线程 + gr.Timer 轮询，所有请求均为短 HTTP
     app.launch(
         server_name="0.0.0.0",
         server_port=7860,
