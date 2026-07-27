@@ -44,20 +44,52 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 # ========== 核心处理逻辑 ==========
 
-def process_uploaded_files(files, model_size, language, use_deepseek, deepseek_api_key, progress=gr.Progress()):
-    """处理本地上传的视频文件"""
+def _progress_html(step: int, total: int, desc: str, done: bool = False) -> str:
+    """渲染单条自定义进度条 HTML"""
+    pct = 100 if done else (min(step / total, 1.0) * 100 if total else 0)
+    color = "#22c55e" if done else "#4f46e5"
+    desc_safe = desc.replace("\"", "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+    return f"""
+    <div class="v2t-progress">
+        <div class="v2t-progress-header">
+            <span class="v2t-progress-desc">{desc_safe}</span>
+            <span class="v2t-progress-pct">{step}/{total}</span>
+        </div>
+        <div class="v2t-progress-track">
+            <div class="v2t-progress-bar" style="width:{pct:.1f}%; background:{color};"></div>
+        </div>
+    </div>
+    """
+
+
+def _results_to_state(results: list) -> list[dict]:
+    """把 TranscriptResult 列表序列化为可在 gr.State 中传递的纯字典列表"""
+    return [
+        {
+            "source": r.source,
+            "title": r.title,
+            "duration": r.duration,
+            "text": r.text,
+            "segments": r.segments,
+            "error": r.error,
+        }
+        for r in results
+    ]
+
+
+def process_uploaded_files_streaming(files, model_size, language, use_deepseek, deepseek_api_key):
+    """处理本地上传的视频文件（流式返回状态，只渲染一条进度条）"""
+    results = []
     try:
         if not files:
-            return "<p style='color:red'>请上传至少一个视频文件</p>", "", None
+            yield _progress_html(0, 1, "请上传至少一个视频文件", done=True), []
+            return
 
         need_reload = (state.model_size != model_size or state.language != language)
         state.model_size = model_size
         state.language = language
         if need_reload:
             state.transcriber = None
-
-        # Gradio 6.x: file_count="multiple" type="filepath" 返回路径字符串列表
-        print(f"[DEBUG] files type: {type(files)}, value: {files}")
 
         if isinstance(files, list):
             video_paths = [f if isinstance(f, str) else getattr(f, 'name', str(f)) for f in files]
@@ -67,89 +99,99 @@ def process_uploaded_files(files, model_size, language, use_deepseek, deepseek_a
             video_paths = [getattr(files, 'name', str(files))]
 
         titles = [Path(p).stem for p in video_paths]
-
-        results = []
-        total = len(video_paths)
-        # 每个文件3子步骤：提取音频(1) + 转写(2) + 完成(3)，首次加载模型额外1步
+        total_files = len(video_paths)
         model_load_step = 1 if state.transcriber is None else 0
-        sub_steps_per_file = 3
-        # 若启用 DeepSeek，额外加 1 步整体清理
         deepseek_step = 1 if use_deepseek else 0
-        total_steps = total * sub_steps_per_file + model_load_step + deepseek_step
-        current_step = 0
+        total_steps = total_files * 3 + model_load_step + deepseek_step
 
-        # 首次加载模型单独显示进度
+        # 准备阶段
+        yield _progress_html(0, total_steps, "正在准备..."), _results_to_state(results)
+
+        # 首次加载模型
         if model_load_step:
-            current_step += 1
-            progress(current_step / total_steps, desc="正在加载 Whisper 模型（首次需下载）...")
+            yield _progress_html(1, total_steps, "正在加载 Whisper 模型（首次需下载）..."), _results_to_state(results)
 
         transcriber = state.get_transcriber()
 
+        current = 1 + model_load_step
         for i, (path, title) in enumerate(zip(video_paths, titles)):
             r = TranscriptResult(source=path, title=title)
 
-            # 子步骤1：提取音频（快速）
-            current_step += 1
-            progress(current_step / total_steps, desc=f"[{i+1}/{total}] 提取音频: {title}")
+            yield _progress_html(current, total_steps, f"[{i+1}/{total_files}] 提取音频: {title}"), _results_to_state(results)
+            current += 1
 
             try:
                 audio_path, duration = transcriber.prepare_audio(path)
                 r.duration = duration
 
-                # 子步骤2：转写（耗时最长）
-                current_step += 1
-                progress(current_step / total_steps, desc=f"[{i+1}/{total}] 正在转写: {title}")
+                yield _progress_html(current, total_steps, f"[{i+1}/{total_files}] 正在转写: {title}"), _results_to_state(results)
+                current += 1
 
                 full_text, segment_list = transcriber.transcribe_audio(audio_path)
                 r.text = full_text
                 r.segments = segment_list
 
-                # 清理临时音频
                 try:
                     os.unlink(audio_path)
                 except OSError:
                     pass
 
-                # 子步骤3：完成
-                current_step += 1
-                progress(current_step / total_steps, desc=f"[{i+1}/{total}] ✅ 完成: {title}")
+                yield _progress_html(current, total_steps, f"[{i+1}/{total_files}] ✅ 完成: {title}"), _results_to_state(results)
+                current += 1
 
             except Exception as e:
                 r.error = str(e)
-                current_step += 2  # 跳过未完成的步骤
-                progress(current_step / total_steps, desc=f"[{i+1}/{total}] ❌ 失败: {title}")
+                current += 2
+                yield _progress_html(
+                    min(current, total_steps), total_steps,
+                    f"[{i+1}/{total_files}] ❌ 失败: {title} — {e}"
+                ), _results_to_state(results)
 
             results.append(r)
+            state.results = results
 
-        # DeepSeek 后处理（批量清理）—— 默认开启，key 从环境变量/输入框读取
         if use_deepseek:
-            current_step += 1
-            progress(current_step / total_steps, desc="🧹 DeepSeek 正在清理重复与错词...")
+            yield _progress_html(current, total_steps, "🧹 DeepSeek 正在清理重复与错词..."), _results_to_state(results)
+            current += 1
+
             api_key = (deepseek_api_key or "").strip()
-            # 输入框为空时，自动回退到部署环境变量（线上默认内嵌）
             if not api_key or api_key.startswith("$"):
                 api_key = os.getenv("DEEPSEEK_API_KEY", "")
             if api_key:
                 try:
                     results = clean_results_with_deepseek(results, api_key)
-                    # 同步更新 segments 文本，保持导出一致
                     for r in results:
                         if r.segments and r.text:
                             for seg in r.segments:
                                 seg["text"] = r.text
+                    state.results = results
                 except Exception as e:
-                    print(f"[WARN] DeepSeek 后处理失败: {e}")
+                    err_msg = f"DeepSeek 后处理失败: {e}"
+                    print(f"[WARN] {err_msg}")
                     traceback.print_exc()
+                    yield _progress_html(total_steps, total_steps, f"⚠️ {err_msg}", done=True), _results_to_state(results)
+                    return
             else:
-                print("[WARN] 已启用 DeepSeek 但 API key 为空（未设置 DEEPSEEK_API_KEY 且输入框未填）")
+                yield _progress_html(
+                    total_steps, total_steps,
+                    "⚠️ 已启用 DeepSeek 但 API key 为空（未设置 DEEPSEEK_API_KEY）",
+                    done=True
+                ), _results_to_state(results)
+                return
 
-        state.results = results
-        progress(1.0, desc="全部完成！")
-        return format_results_table(results), format_results_text(results), generate_export_json(results)
+        yield _progress_html(total_steps, total_steps, "✅ 全部完成！", done=True), _results_to_state(results)
 
     except Exception as e:
         traceback.print_exc()
-        return f"<p style='color:red'>处理出错: {e}</p>", "", None
+        yield _progress_html(0, 1, f"❌ 处理出错: {e}", done=True), _results_to_state(results)
+
+
+def render_results(_state_data):
+    """根据 state.results 渲染最终结果区（由 .then() 调用）"""
+    results = state.results
+    if not results:
+        return "<p style='color:#888; text-align:center; padding:20px;'>暂无结果</p>", "", None
+    return format_results_table(results), format_results_text(results), generate_export_json(results)
 
 
 # ========== 结果格式化 ==========
@@ -326,7 +368,12 @@ def export_excel_from_state():
 
 def clear_results():
     state.results = []
-    return "<p style='color:#888; text-align:center; padding:20px;'>已清空，请上传视频文件</p>", "", None
+    return (
+        "<p style='color:#888; text-align:center; padding:20px;'>已清空，请上传视频文件</p>",
+        "",
+        None,
+        "",
+    )
 
 
 # ========== Gradio 界面 ==========
@@ -524,6 +571,52 @@ CUSTOM_CSS = """
     margin-bottom: 8px !important;
 }
 
+/* 单一状态/进度条区域 */
+.status-box {
+    margin-bottom: 16px;
+}
+
+.v2t-progress {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 14px 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+}
+
+.v2t-progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    font-size: 14px;
+    color: #334155;
+}
+
+.v2t-progress-desc {
+    font-weight: 500;
+}
+
+.v2t-progress-pct {
+    color: #64748b;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+}
+
+.v2t-progress-track {
+    width: 100%;
+    height: 10px;
+    background: #e2e8f0;
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.v2t-progress-bar {
+    height: 100%;
+    border-radius: 999px;
+    transition: width 0.25s ease;
+}
+
 /* 移动端适配 */
 @media (max-width: 768px) {
     .gradio-container {
@@ -610,6 +703,14 @@ def build_app():
             with gr.Column(elem_classes="result-card"):
                 gr.Markdown("## 📋 转写结果")
 
+                # 单一状态/进度条（替代 Gradio 多输出进度条）
+                status_box = gr.HTML(
+                    value="<p style='color:#888; text-align:center; padding:12px;'>点击「开始转写」后在此显示进度</p>",
+                    elem_classes="status-box"
+                )
+                # 隐藏状态，用于触发最终渲染
+                results_state = gr.State(value=[])
+
                 result_table = gr.HTML(
                     value="<p style='color:#888; text-align:center; padding:20px;'>暂无结果，请上传视频文件</p>",
                     elem_classes="result-table-wrap"
@@ -636,9 +737,15 @@ def build_app():
                     gr.Markdown(FAQ_MD)
 
         # 事件绑定
+        # 流式处理：只更新单一状态区，隐藏 Gradio 默认的多输出进度条
         upload_btn.click(
-            fn=process_uploaded_files,
+            fn=process_uploaded_files_streaming,
             inputs=[file_input, model_size, language, use_deepseek, deepseek_api_key],
+            outputs=[status_box, results_state],
+            show_progress="hidden",
+        ).then(
+            fn=render_results,
+            inputs=[results_state],
             outputs=[result_table, result_text, export_file]
         )
 
@@ -648,7 +755,7 @@ def build_app():
 
         clear_btn.click(
             fn=clear_results,
-            outputs=[result_table, result_text, export_file]
+            outputs=[result_table, result_text, export_file, status_box]
         )
 
     return app
@@ -658,6 +765,12 @@ def build_app():
 
 if __name__ == "__main__":
     app = build_app()
+    # 启用队列：长转写任务用持久连接，避免代理/负载均衡超时断开
+    app.queue(
+        default_concurrency_limit=1,
+        max_size=20,
+        status_update_rate="auto",
+    )
     app.launch(
         server_name="0.0.0.0",
         server_port=7860,
