@@ -92,10 +92,10 @@ def _clean_yt_dlp_error(stderr: str, url: str) -> str:
     # cookies 相关错误
     if any(k in stderr_lower for k in ["cookies", "cookie"]):
         if "douyin" in url.lower() or "v.douyin.com" in url.lower():
-            return "抖音下载需要 cookies：请配置抖音登录后的 cookies.txt 文件（详见页面下方说明）"
+            return "抖音 cookies 无效或已过期：请重新从抖音网页版导出 cookies.txt 并上传"
         if "channels.weixin" in url.lower():
-            return "视频号下载需要 cookies：请配置微信登录后的 cookies.txt 文件"
-        return "该平台下载需要 cookies，请在下方配置 cookies.txt 文件后重试"
+            return "视频号 cookies 无效或已过期：请重新导出 cookies.txt 并上传"
+        return "cookies 无效或已过期，请重新导出 cookies.txt 文件后重试"
 
     # 版权/地区/私有限制
     if any(k in stderr_lower for k in ["private", "unavailable", "restricted", "removed"]):

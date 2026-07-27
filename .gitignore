@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 models/
 cookies/
+cookies.txt
 *.egg-info/
 dist/
 build/

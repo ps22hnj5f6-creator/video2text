@@ -144,6 +144,15 @@ def process_video_links(text, model_size, language, cookie_path, progress=gr.Pro
         if need_reload:
             state.transcriber = None
 
+        # 处理 cookie_path：Gradio File 上传组件可能返回 None 或 filepath
+        # 如果有值但不是字符串，尝试提取路径
+        effective_cookie = None
+        if cookie_path:
+            if isinstance(cookie_path, str) and os.path.exists(cookie_path):
+                effective_cookie = cookie_path
+            elif hasattr(cookie_path, 'name'):
+                effective_cookie = cookie_path.name
+
         model_load_step = 1 if state.transcriber is None else 0
         current_step = 0
         results = []
@@ -151,7 +160,7 @@ def process_video_links(text, model_size, language, cookie_path, progress=gr.Pro
         # 下载阶段
         progress(0.05, desc=f"批量下载 {len(urls)} 个视频...")
         download_results = download_batch(urls, output_dir=TEMP_DIR,
-                                           cookie_file=cookie_path if cookie_path else None)
+                                           cookie_file=effective_cookie)
 
         video_paths = []
         titles = []
@@ -394,13 +403,15 @@ LINK_HINT_MD = """
 
 COOKIE_HELP_MD = """
 <div style="background:#f0f9ff; border:1px solid #bae6fd; border-radius:8px; padding:12px 16px; margin-top:8px;">
-    <p style="margin:0 0 8px; color:#075985; font-weight:600;">🍪 如何获取 Cookies</p>
+    <p style="margin:0 0 8px; color:#075985; font-weight:600;">🍪 如何获取 Cookies（3 步搞定）</p>
     <ol style="margin:0; padding-left:20px; color:#0c4a6e; font-size:13px; line-height:1.8;">
-        <li>用 Chrome/Edge 浏览器登录抖音（或视频号）网页版</li>
-        <li>安装浏览器插件 <b>Get cookies.txt LOCALLY</b></li>
-        <li>在抖音页面点击插件，导出为 <b>Netscape 格式</b> 的 cookies.txt 文件</li>
-        <li>将文件路径填入下方输入框（线上部署时建议先上传到容器可访问路径）</li>
+        <li>用 Chrome/Edge 浏览器登录 <b>抖音网页版</b>（www.douyin.com）</li>
+        <li>安装浏览器插件 <b>Get cookies.txt LOCALLY</b>（Chrome 应用商店搜索即可）</li>
+        <li>在抖音页面点击插件图标 → 导出为 <b>Netscape 格式</b> → 保存 cookies.txt → 直接上传到下方</li>
     </ol>
+    <p style="margin:8px 0 0; color:#0369a1; font-size:13px;">
+        💡 提示：导出时确保在<b>抖音页面</b>上操作，否则 cookies 可能不包含抖音域名。Cookies 有效期约数天，过期后需重新导出。
+    </p>
 </div>
 """
 
@@ -578,12 +589,13 @@ def build_app():
                             elem_classes="primary-btn"
                         )
 
-                        with gr.Accordion("🍪 Cookies 配置（抖音/视频号必需）", open=False):
+                        with gr.Accordion("🍪 Cookies 配置（抖音/视频号必需）", open=True):
                             gr.Markdown(COOKIE_HELP_MD)
-                            cookie_file = gr.Textbox(
-                                label="Cookies 文件路径",
-                                placeholder="/path/to/cookies.txt",
-                                value=""
+                            cookie_file = gr.File(
+                                label="上传 cookies.txt 文件",
+                                file_types=[".txt"],
+                                type="filepath",
+                                value=None
                             )
 
             # 结果区
