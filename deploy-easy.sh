@@ -7,7 +7,7 @@ set -e
 # =============================================
 # 改这两行就行！
 # =============================================
-ACR_REGISTRY="registry.cn-hangzhou.aliyuncs.com"   # 华东1（杭州）
+ACR_REGISTRY="crpi-48rfadbeb000k7yc8.cn-hangzhou.personal.cr.aliyuncs.com"   # 华东1（杭州）
 ACR_NAMESPACE="video2text"                # ACR 命名空间（需提前在阿里云创建）
 
 IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/video2text:latest"
