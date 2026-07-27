@@ -190,86 +190,96 @@ class WhisperTranscriber:
         text = re.sub(r'([，])\1+', r'\1', text)       # 逗号不重复
         return text
 
+    def prepare_audio(self, video_path: str) -> tuple:
+        """提取音频并获取时长（单独步骤，用于进度跟踪）"""
+        duration = get_video_duration(video_path)
+        audio_path = extract_audio(video_path)
+        return audio_path, duration
+
+    def transcribe_audio(self, audio_path: str, language: str = None) -> tuple:
+        """转写已提取的音频（单独步骤，用于进度跟踪）
+        返回 (full_text, segment_list)
+        """
+        self._load_model()
+
+        if language is None:
+            language = self.language
+
+        # 根据语言选择提示词
+        initial_prompt = None
+        if language == "zh" or language is None:
+            initial_prompt = self.ZH_FINANCE_PROMPT
+
+        segments_iter, info = self._model.transcribe(
+            audio_path,
+            language=language,
+            initial_prompt=initial_prompt,
+            beam_size=5,
+            best_of=5,
+            temperature=0.0,
+            condition_on_previous_text=True,
+            no_speech_threshold=0.6,
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=300,
+                threshold=0.5
+            ),
+            word_timestamps=True,
+        )
+
+        # 收集结果 + 加标点
+        full_text = ""
+        segment_list = []
+        prev_end = 0.0
+
+        for seg in segments_iter:
+            text = seg.text.strip()
+
+            # 根据段间停顿自动加标点
+            gap = seg.start - prev_end
+            if prev_end > 0 and gap > 1.5 and text:
+                if full_text and not full_text.endswith(("。", "！", "？", ".", "!", "?", "，", ",")):
+                    full_text += "。"
+            elif prev_end > 0 and gap > 0.6 and text:
+                if full_text and not full_text.endswith(("。", "！", "？", ".", "!", "?", "，", ",")):
+                    full_text += "，"
+
+            full_text += text
+            prev_end = seg.end
+
+            segment_list.append({
+                "start": round(seg.start, 2),
+                "end": round(seg.end, 2),
+                "text": text
+            })
+
+        # 句末补句号
+        if full_text and not full_text.endswith(("。", "！", "？", ".", "!", "?")):
+            full_text += "。"
+
+        # 错别字纠正
+        full_text = self._correct_typos(full_text)
+        for seg in segment_list:
+            seg["text"] = self._correct_typos(seg["text"])
+
+        return full_text, segment_list
+
     def transcribe_file(self, video_path: str, title: str = "") -> TranscriptResult:
-        """转写单个视频文件"""
+        """转写单个视频文件（一次性调用，不含进度跟踪）"""
         result = TranscriptResult(source=video_path, title=title)
 
         try:
-            # 1. 获取时长
-            result.duration = get_video_duration(video_path)
+            # 1. 提取音频 + 获取时长
+            audio_path, duration = self.prepare_audio(video_path)
+            result.duration = duration
 
-            # 2. 提取音频
-            audio_path = extract_audio(video_path)
-
-            # 3. 加载模型
-            self._load_model()
-
-            # 4. 转写（使用金融提示词 + 更严格解码参数）
-            print(f"正在转写: {title or video_path}")
-
-            # 根据语言选择提示词
-            initial_prompt = None
-            if self.language == "zh" or self.language is None:
-                initial_prompt = self.ZH_FINANCE_PROMPT
-
-            segments_iter, info = self._model.transcribe(
-                audio_path,
-                language=self.language,
-                initial_prompt=initial_prompt,  # 提示词：输出标点 + 金融术语
-                beam_size=5,                     # 更准确的解码
-                best_of=5,                       # 保留最优候选
-                temperature=0.0,                 # 低温度=更准确、少幻觉
-                condition_on_previous_text=True,  # 利用上文减少重复
-                no_speech_threshold=0.6,         # 更严格的静音检测
-                vad_filter=True,                 # VAD过滤静音段
-                vad_parameters=dict(
-                    min_silence_duration_ms=300,  # 300ms静音即分段（标点依据）
-                    threshold=0.5
-                ),
-                word_timestamps=True,            # 词级时间戳（更精确对齐）
-            )
-
-            # 5. 收集结果 + 加标点
-            full_text = ""
-            segment_list = []
-            prev_end = 0.0
-
-            for seg in segments_iter:
-                text = seg.text.strip()
-
-                # 根据段间停顿自动加标点
-                gap = seg.start - prev_end
-                if prev_end > 0 and gap > 1.5 and text:
-                    # 停顿>1.5秒 → 加句号
-                    if full_text and not full_text.endswith(("。", "！", "？", ".", "!", "?", "，", ",")):
-                        full_text += "。"
-                elif prev_end > 0 and gap > 0.6 and text:
-                    # 停顿0.6-1.5秒 → 加逗号
-                    if full_text and not full_text.endswith(("。", "！", "？", ".", "!", "?", "，", ",")):
-                        full_text += "，"
-
-                full_text += text
-                prev_end = seg.end
-
-                segment_list.append({
-                    "start": round(seg.start, 2),
-                    "end": round(seg.end, 2),
-                    "text": text
-                })
-
-            # 句末补句号
-            if full_text and not full_text.endswith(("。", "！", "？", ".", "!", "?")):
-                full_text += "。"
-
-            # 6. 错别字纠正
-            full_text = self._correct_typos(full_text)
-            for seg in segment_list:
-                seg["text"] = self._correct_typos(seg["text"])
+            # 2. 转写
+            full_text, segment_list = self.transcribe_audio(audio_path)
 
             result.text = full_text
             result.segments = segment_list
 
-            # 6. 清理临时音频文件
+            # 3. 清理临时音频文件
             try:
                 os.unlink(audio_path)
             except OSError:

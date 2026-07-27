@@ -55,7 +55,6 @@ def process_uploaded_files(files, model_size, language, progress=gr.Progress()):
         state.language = language
         if need_reload:
             state.transcriber = None
-        transcriber = state.get_transcriber()
 
         # Gradio 6.x: file_count="multiple" type="filepath" 返回路径字符串列表
         print(f"[DEBUG] files type: {type(files)}, value: {files}")
@@ -71,13 +70,57 @@ def process_uploaded_files(files, model_size, language, progress=gr.Progress()):
 
         results = []
         total = len(video_paths)
+        # 每个文件3子步骤：提取音频(1) + 转写(2) + 完成(3)，首次加载模型额外1步
+        model_load_step = 1 if state.transcriber is None else 0
+        sub_steps_per_file = 3
+        total_steps = total * sub_steps_per_file + model_load_step
+        current_step = 0
+
+        # 首次加载模型单独显示进度
+        if model_load_step:
+            current_step += 1
+            progress(current_step / total_steps, desc="正在加载 Whisper 模型（首次需下载）...")
+
+        transcriber = state.get_transcriber()
 
         for i, (path, title) in enumerate(zip(video_paths, titles)):
-            progress((i + 1) / total, desc=f"转写 {i+1}/{total}: {title}")
-            r = transcriber.transcribe_file(path, title)
+            r = TranscriptResult(source=path, title=title)
+
+            # 子步骤1：提取音频（快速）
+            current_step += 1
+            progress(current_step / total_steps, desc=f"[{i+1}/{total}] 提取音频: {title}")
+
+            try:
+                audio_path, duration = transcriber.prepare_audio(path)
+                r.duration = duration
+
+                # 子步骤2：转写（耗时最长）
+                current_step += 1
+                progress(current_step / total_steps, desc=f"[{i+1}/{total}] 正在转写: {title}")
+
+                full_text, segment_list = transcriber.transcribe_audio(audio_path)
+                r.text = full_text
+                r.segments = segment_list
+
+                # 清理临时音频
+                try:
+                    os.unlink(audio_path)
+                except OSError:
+                    pass
+
+                # 子步骤3：完成
+                current_step += 1
+                progress(current_step / total_steps, desc=f"[{i+1}/{total}] ✅ 完成: {title}")
+
+            except Exception as e:
+                r.error = str(e)
+                current_step += 2  # 跳过未完成的步骤
+                progress(current_step / total_steps, desc=f"[{i+1}/{total}] ❌ 失败: {title}")
+
             results.append(r)
 
         state.results = results
+        progress(1.0, desc="全部完成！")
         return format_results_table(results), format_results_text(results), generate_export_json(results)
 
     except Exception as e:
@@ -101,37 +144,88 @@ def process_video_links(text, model_size, language, cookie_path, progress=gr.Pro
         if need_reload:
             state.transcriber = None
 
-        progress(0.1, desc=f"下载 {len(urls)} 个视频...")
+        model_load_step = 1 if state.transcriber is None else 0
+        current_step = 0
+        results = []
+
+        # 下载阶段
+        progress(0.05, desc=f"批量下载 {len(urls)} 个视频...")
         download_results = download_batch(urls, output_dir=TEMP_DIR,
                                            cookie_file=cookie_path if cookie_path else None)
 
         video_paths = []
         titles = []
-        for dr in download_results:
+        download_success_indices = []
+        for idx, dr in enumerate(download_results):
             if dr.error:
-                state.results.append(TranscriptResult(
+                results.append(TranscriptResult(
                     source=dr.url, title=dr.title or dr.url, text="", error=dr.error
                 ))
             else:
                 video_paths.append(dr.file_path)
                 titles.append(dr.title)
+                download_success_indices.append(idx)
 
         if not video_paths:
-            return format_results_table(state.results), format_results_text(state.results), None
+            state.results = results
+            progress(1.0, desc="下载全部失败")
+            return format_results_table(results), format_results_text(results), None
+
+        # 总步骤：下载1 + 模型加载1(首次) + 每文件3子步骤
+        total_steps = 1 + model_load_step + len(video_paths) * 3
+        current_step = 1  # 下载已完成
+
+        # 首次加载模型
+        if model_load_step:
+            current_step += 1
+            progress(current_step / total_steps,
+                     desc="正在加载 Whisper 模型（首次需下载）...")
 
         transcriber = state.get_transcriber()
-        total_download = len(urls)
-        total_transcribe = len(video_paths)
 
+        # 转写阶段
         for i, (path, title) in enumerate(zip(video_paths, titles)):
-            step = total_download + i + 1
-            total = total_download + total_transcribe
-            progress(step / total, desc=f"转写 {i+1}/{total_transcribe}: {title}")
-            r = transcriber.transcribe_file(path, title)
-            r.source = download_results[i].url if i < len(download_results) else path
-            state.results.append(r)
+            r = TranscriptResult(source=download_results[download_success_indices[i]].url, title=title)
 
-        return format_results_table(state.results), format_results_text(state.results), generate_export_json(state.results)
+            # 提取音频
+            current_step += 1
+            progress(current_step / total_steps,
+                     desc=f"[{i+1}/{len(video_paths)}] 提取音频: {title}")
+
+            try:
+                audio_path, duration = transcriber.prepare_audio(path)
+                r.duration = duration
+
+                # 转写
+                current_step += 1
+                progress(current_step / total_steps,
+                         desc=f"[{i+1}/{len(video_paths)}] 正在转写: {title}")
+
+                full_text, segment_list = transcriber.transcribe_audio(audio_path)
+                r.text = full_text
+                r.segments = segment_list
+
+                try:
+                    os.unlink(audio_path)
+                except OSError:
+                    pass
+
+                # 完成
+                current_step += 1
+                progress(current_step / total_steps,
+                         desc=f"[{i+1}/{len(video_paths)}] ✅ 完成: {title}")
+
+            except Exception as e:
+                r.error = str(e)
+                current_step += 2
+                progress(current_step / total_steps,
+                         desc=f"[{i+1}/{len(video_paths)}] ❌ 失败: {title}")
+
+            results.append(r)
+
+        state.results = results
+        progress(1.0, desc="全部完成！")
+        return format_results_table(results), format_results_text(results), generate_export_json(results)
 
     except Exception as e:
         traceback.print_exc()
