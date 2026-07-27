@@ -13,7 +13,6 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 import gradio as gr
 
 from transcriber import WhisperTranscriber, TranscriptResult, create_transcriber
-from downloader import download_video, download_batch, extract_urls, format_share_text
 
 
 # ========== 全局状态 ==========
@@ -116,119 +115,6 @@ def process_uploaded_files(files, model_size, language, progress=gr.Progress()):
                 r.error = str(e)
                 current_step += 2  # 跳过未完成的步骤
                 progress(current_step / total_steps, desc=f"[{i+1}/{total}] ❌ 失败: {title}")
-
-            results.append(r)
-
-        state.results = results
-        progress(1.0, desc="全部完成！")
-        return format_results_table(results), format_results_text(results), generate_export_json(results)
-
-    except Exception as e:
-        traceback.print_exc()
-        return f"<p style='color:red'>处理出错: {e}</p>", "", None
-
-
-def process_video_links(text, model_size, language, cookie_path, progress=gr.Progress()):
-    """处理粘贴的视频链接"""
-    try:
-        if not text or not text.strip():
-            return "<p style='color:red'>请粘贴至少一个视频链接</p>", "", None
-
-        urls = format_share_text(text.strip())
-        if not urls:
-            return "<p style='color:red'>未识别到有效链接，请粘贴完整的视频分享链接</p>", "", None
-
-        need_reload = (state.model_size != model_size or state.language != language)
-        state.model_size = model_size
-        state.language = language
-        if need_reload:
-            state.transcriber = None
-
-        # 处理 cookie_path：Gradio File 上传组件可能返回 None 或 filepath
-        # 如果有值但不是字符串，尝试提取路径
-        effective_cookie = None
-        if cookie_path:
-            if isinstance(cookie_path, str) and os.path.exists(cookie_path):
-                effective_cookie = cookie_path
-            elif hasattr(cookie_path, 'name'):
-                effective_cookie = cookie_path.name
-
-        model_load_step = 1 if state.transcriber is None else 0
-        current_step = 0
-        results = []
-
-        # 下载阶段
-        progress(0.05, desc=f"批量下载 {len(urls)} 个视频...")
-        download_results = download_batch(urls, output_dir=TEMP_DIR,
-                                           cookie_file=effective_cookie)
-
-        video_paths = []
-        titles = []
-        download_success_indices = []
-        for idx, dr in enumerate(download_results):
-            if dr.error:
-                results.append(TranscriptResult(
-                    source=dr.url, title=dr.title or dr.url, text="", error=dr.error
-                ))
-            else:
-                video_paths.append(dr.file_path)
-                titles.append(dr.title)
-                download_success_indices.append(idx)
-
-        if not video_paths:
-            state.results = results
-            progress(1.0, desc="下载全部失败")
-            return format_results_table(results), format_results_text(results), None
-
-        # 总步骤：下载1 + 模型加载1(首次) + 每文件3子步骤
-        total_steps = 1 + model_load_step + len(video_paths) * 3
-        current_step = 1  # 下载已完成
-
-        # 首次加载模型
-        if model_load_step:
-            current_step += 1
-            progress(current_step / total_steps,
-                     desc="正在加载 Whisper 模型（首次需下载）...")
-
-        transcriber = state.get_transcriber()
-
-        # 转写阶段
-        for i, (path, title) in enumerate(zip(video_paths, titles)):
-            r = TranscriptResult(source=download_results[download_success_indices[i]].url, title=title)
-
-            # 提取音频
-            current_step += 1
-            progress(current_step / total_steps,
-                     desc=f"[{i+1}/{len(video_paths)}] 提取音频: {title}")
-
-            try:
-                audio_path, duration = transcriber.prepare_audio(path)
-                r.duration = duration
-
-                # 转写
-                current_step += 1
-                progress(current_step / total_steps,
-                         desc=f"[{i+1}/{len(video_paths)}] 正在转写: {title}")
-
-                full_text, segment_list = transcriber.transcribe_audio(audio_path)
-                r.text = full_text
-                r.segments = segment_list
-
-                try:
-                    os.unlink(audio_path)
-                except OSError:
-                    pass
-
-                # 完成
-                current_step += 1
-                progress(current_step / total_steps,
-                         desc=f"[{i+1}/{len(video_paths)}] ✅ 完成: {title}")
-
-            except Exception as e:
-                r.error = str(e)
-                current_step += 2
-                progress(current_step / total_steps,
-                         desc=f"[{i+1}/{len(video_paths)}] ❌ 失败: {title}")
 
             results.append(r)
 
@@ -371,7 +257,7 @@ def export_excel_from_state():
 
 def clear_results():
     state.results = []
-    return "<p>已清空，请上传视频或粘贴链接</p>", "", None
+    return "<p style='color:#888; text-align:center; padding:20px;'>已清空，请上传视频文件</p>", "", None
 
 
 # ========== Gradio 界面 ==========
@@ -381,7 +267,7 @@ HEADER_MD = """
 <div style="text-align:center; margin-bottom:8px;">
     <h1 style="margin:0; font-size:32px; font-weight:700;">🎬 短视频批量转文字</h1>
     <p style="margin:8px 0 0; color:#666; font-size:15px;">
-        上传短视频或粘贴分享链接，自动提取语音转写为文字。支持抖音、视频号等平台。
+        批量上传短视频文件，自动提取语音转写为文字。支持 MP4、MOV、AVI、WebM 等常见格式。
     </p>
     <p style="margin:4px 0 0; color:#999; font-size:13px;">
         视频时长建议 ≤ 90 秒，更长视频也能处理但耗时增加。
@@ -389,38 +275,7 @@ HEADER_MD = """
 </div>
 """
 
-LINK_HINT_MD = """
-<div style="background:#fff7ed; border:1px solid #fed7aa; border-radius:8px; padding:12px 16px; margin:8px 0 16px;">
-    <p style="margin:0 0 6px; color:#9a3412; font-weight:600;">📌 粘贴说明</p>
-    <p style="margin:0 0 4px; color:#7c2d12; font-size:13px;">
-        每行一个链接，可直接粘贴抖音/视频号完整的分享文本，系统会自动提取链接。
-    </p>
-    <p style="margin:0; color:#c2410c; font-size:13px;">
-        ⚠️ <b>抖音、视频号必须配置 cookies 才能下载</b>，请见下方「Cookies 配置」。
-    </p>
-</div>
-"""
-
-COOKIE_HELP_MD = """
-<div style="background:#f0f9ff; border:1px solid #bae6fd; border-radius:8px; padding:12px 16px; margin-top:8px;">
-    <p style="margin:0 0 8px; color:#075985; font-weight:600;">🍪 如何获取 Cookies（3 步搞定）</p>
-    <ol style="margin:0; padding-left:20px; color:#0c4a6e; font-size:13px; line-height:1.8;">
-        <li>用 Chrome/Edge 浏览器登录 <b>抖音网页版</b>（www.douyin.com）</li>
-        <li>安装浏览器插件 <b>Get cookies.txt LOCALLY</b>（Chrome 应用商店搜索即可）</li>
-        <li>在抖音页面点击插件图标 → 导出为 <b>Netscape 格式</b> → 保存 cookies.txt → 直接上传到下方</li>
-    </ol>
-    <p style="margin:8px 0 0; color:#0369a1; font-size:13px;">
-        💡 提示：导出时确保在<b>抖音页面</b>上操作，否则 cookies 可能不包含抖音域名。Cookies 有效期约数天，过期后需重新导出。
-    </p>
-</div>
-"""
-
 FAQ_MD = """
-### 支持的平台
-- 抖音（需 cookies）
-- 微信视频号（需 cookies）
-- B站、YouTube、微博等 yt-dlp 支持的所有平台
-
 ### 性能参考
 | 模型 | 内存占用 | 90s视频转写耗时(CPU) | 中文准确率 |
 |------|---------|---------------------|----------|
@@ -432,7 +287,7 @@ FAQ_MD = """
 ### 注意事项
 - 首次运行会自动下载模型文件（base约74MB），后续不再重复下载
 - CPU模式足够应对90s短视频，GPU可加速4-10倍
-- 证券金融术语建议用 base 或以上模型，tiny容易出错
+- 金融、证券专业术语建议用 base 或以上模型，tiny容易出错
 - 如需更高准确率，可后续切换到腾讯云ASR引擎
 """
 
@@ -470,7 +325,7 @@ CUSTOM_CSS = """
     text-align: center;
 }
 
-/* Tab 容器卡片 */
+/* 上传区卡片 */
 .main-card {
     background: #ffffff;
     border-radius: 16px;
@@ -556,54 +411,27 @@ def build_app():
                     info="zh=中文, en=英文, auto=自动检测（稍慢）"
                 )
 
-            # Tab 主功能区
+            # 上传区
             with gr.Column(elem_classes="main-card"):
-                with gr.Tabs():
-                    # 本地上传 Tab
-                    with gr.Tab("📁 本地上传"):
-                        file_input = gr.File(
-                            label="上传短视频",
-                            file_count="multiple",
-                            file_types=[".mp4", ".mov", ".avi", ".webm", ".mkv", ".flv", ".3gp"],
-                            type="filepath"
-                        )
-                        upload_btn = gr.Button(
-                            "🚀 开始转写",
-                            variant="primary",
-                            size="lg",
-                            elem_classes="primary-btn"
-                        )
-
-                    # 链接下载 Tab
-                    with gr.Tab("🔗 链接下载"):
-                        gr.Markdown(LINK_HINT_MD)
-                        link_input = gr.Textbox(
-                            label="粘贴分享文本 / 链接",
-                            placeholder="每行一个链接，或直接粘贴完整的分享文本...",
-                            lines=5,
-                        )
-                        link_btn = gr.Button(
-                            "🚀 下载并转写",
-                            variant="primary",
-                            size="lg",
-                            elem_classes="primary-btn"
-                        )
-
-                        with gr.Accordion("🍪 Cookies 配置（抖音/视频号必需）", open=True):
-                            gr.Markdown(COOKIE_HELP_MD)
-                            cookie_file = gr.File(
-                                label="上传 cookies.txt 文件",
-                                file_types=[".txt"],
-                                type="filepath",
-                                value=None
-                            )
+                file_input = gr.File(
+                    label="上传短视频",
+                    file_count="multiple",
+                    file_types=[".mp4", ".mov", ".avi", ".webm", ".mkv", ".flv", ".3gp"],
+                    type="filepath"
+                )
+                upload_btn = gr.Button(
+                    "🚀 开始转写",
+                    variant="primary",
+                    size="lg",
+                    elem_classes="primary-btn"
+                )
 
             # 结果区
             with gr.Column(elem_classes="result-card"):
                 gr.Markdown("## 📋 转写结果")
 
                 result_table = gr.HTML(
-                    value="<p style='color:#888; text-align:center; padding:20px;'>暂无结果，请上传视频或粘贴链接</p>",
+                    value="<p style='color:#888; text-align:center; padding:20px;'>暂无结果，请上传视频文件</p>",
                     elem_classes="result-table-wrap"
                 )
 
@@ -631,12 +459,6 @@ def build_app():
         upload_btn.click(
             fn=process_uploaded_files,
             inputs=[file_input, model_size, language],
-            outputs=[result_table, result_text, export_file]
-        )
-
-        link_btn.click(
-            fn=process_video_links,
-            inputs=[link_input, model_size, language, cookie_file],
             outputs=[result_table, result_text, export_file]
         )
 
