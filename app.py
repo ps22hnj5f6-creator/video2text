@@ -13,6 +13,7 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 import gradio as gr
 
 from transcriber import WhisperTranscriber, TranscriptResult, create_transcriber
+from deepseek_cleaner import clean_results_with_deepseek
 
 
 # ========== 全局状态 ==========
@@ -43,7 +44,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 # ========== 核心处理逻辑 ==========
 
-def process_uploaded_files(files, model_size, language, progress=gr.Progress()):
+def process_uploaded_files(files, model_size, language, use_deepseek, deepseek_api_key, progress=gr.Progress()):
     """处理本地上传的视频文件"""
     try:
         if not files:
@@ -72,7 +73,9 @@ def process_uploaded_files(files, model_size, language, progress=gr.Progress()):
         # 每个文件3子步骤：提取音频(1) + 转写(2) + 完成(3)，首次加载模型额外1步
         model_load_step = 1 if state.transcriber is None else 0
         sub_steps_per_file = 3
-        total_steps = total * sub_steps_per_file + model_load_step
+        # 若启用 DeepSeek，额外加 1 步整体清理
+        deepseek_step = 1 if use_deepseek else 0
+        total_steps = total * sub_steps_per_file + model_load_step + deepseek_step
         current_step = 0
 
         # 首次加载模型单独显示进度
@@ -117,6 +120,28 @@ def process_uploaded_files(files, model_size, language, progress=gr.Progress()):
                 progress(current_step / total_steps, desc=f"[{i+1}/{total}] ❌ 失败: {title}")
 
             results.append(r)
+
+        # DeepSeek 后处理（批量清理）
+        if use_deepseek and deepseek_api_key and deepseek_api_key.strip():
+            current_step += 1
+            progress(current_step / total_steps, desc="🧹 DeepSeek 正在清理重复与错词...")
+            api_key = deepseek_api_key.strip()
+            # 优先读取环境变量中的 key（线上部署更安全）
+            if api_key == "${DEEPSEEK_API_KEY}" or api_key.startswith("$"):
+                api_key = os.getenv("DEEPSEEK_API_KEY", "")
+            if api_key:
+                try:
+                    results = clean_results_with_deepseek(results, api_key)
+                    # 同步更新 segments 文本，保持导出一致
+                    for r in results:
+                        if r.segments and r.text:
+                            for seg in r.segments:
+                                seg["text"] = r.text
+                except Exception as e:
+                    print(f"[WARN] DeepSeek 后处理失败: {e}")
+                    traceback.print_exc()
+            else:
+                print("[WARN] 已启用 DeepSeek 但 API key 为空")
 
         state.results = results
         progress(1.0, desc="全部完成！")
@@ -543,6 +568,29 @@ def build_app():
                     info="zh=中文, en=英文, auto=自动检测（稍慢）"
                 )
 
+            # DeepSeek 后处理配置
+            with gr.Column(elem_classes="main-card"):
+                with gr.Row(equal_height=True):
+                    use_deepseek = gr.Checkbox(
+                        label="✨ 使用 DeepSeek 后处理",
+                        value=False,
+                        info="清理末尾重复、纠正同音错别字和金融术语（推荐开启）",
+                    )
+                    deepseek_api_key = gr.Textbox(
+                        label="DeepSeek API Key",
+                        placeholder="sk-...  或线上部署时留空，从环境变量 DEEPSEEK_API_KEY 读取",
+                        value="",
+                        type="password",
+                        max_lines=1,
+                        show_label=True,
+                        info="Key 仅用于本次请求，不会保存到服务器",
+                    )
+                gr.Markdown(
+                    "<p style='margin:0; color:#888; font-size:12px;'>"
+                    "没有 Key？前往 <a href='https://platform.deepseek.com' target='_blank'>DeepSeek 开放平台</a> 申请；"
+                    "线上部署建议在 Sealos 环境变量中设置 <code>DEEPSEEK_API_KEY</code>。</p>"
+                )
+
             # 上传区
             with gr.Column(elem_classes="main-card"):
                 file_input = gr.File(
@@ -590,7 +638,7 @@ def build_app():
         # 事件绑定
         upload_btn.click(
             fn=process_uploaded_files,
-            inputs=[file_input, model_size, language],
+            inputs=[file_input, model_size, language, use_deepseek, deepseek_api_key],
             outputs=[result_table, result_text, export_file]
         )
 

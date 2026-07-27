@@ -9,5 +9,8 @@ imageio-ffmpeg>=0.4.0      # ffmpeg二进制（无需系统安装ffmpeg）
 # 导出格式
 openpyxl>=3.0.0            # Excel导出（可选）
 
+# LLM 后处理（可选）
+openai>=1.0.0              # DeepSeek/OpenAI 兼容接口，用于清理重复、纠正错词
+
 # 备用引擎（可选）
 # tencentcloud-sdk-python>=3.0.0  # 腾讯云ASR（更高准确率）

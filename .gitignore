@@ -13,3 +13,5 @@ hf_cache/
 *.mp4
 *.mov
 *.mp3
+test_*.py
+.DS_Store
