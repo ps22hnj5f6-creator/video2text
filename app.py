@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""短视频批量转文字 - Gradio Web 应用（兼容 Gradio 6.x）"""
+"""短视频批量转文字 - Gradio Web 应用（兼容 Gradio 4.44）"""
 
 import os
 import json

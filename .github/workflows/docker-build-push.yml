@@ -52,3 +52,31 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Smoke test - verify app boots
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${SHORT_SHA}"
+          echo "Smoke testing $IMAGE"
+          docker pull "$IMAGE"
+          docker run -d --name v2t-smoke -p 7860:7860 \
+            -e HF_ENDPOINT=https://hf-mirror.com \
+            "$IMAGE"
+          BOOTED=false
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:7860/ >/dev/null 2>&1; then
+              BOOTED=true
+              echo "APP_BOOTED_OK after ${i} tries"
+              break
+            fi
+            sleep 3
+          done
+          echo "--- container logs ---"
+          docker logs v2t-smoke || true
+          if [ "$BOOTED" = "false" ]; then
+            echo "SMOKE_TEST_FAILED: app did not boot"
+            docker rm -f v2t-smoke || true
+            exit 1
+          fi
+          curl -fsS http://localhost:7860/ | grep -o "短视频批量转文字" && echo "TITLE_FOUND" || echo "TITLE_MISSING"
+          docker rm -f v2t-smoke || true
