@@ -6,8 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  ACR_LOGIN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
-  ACR_PUSH_REGISTRY: crpi-48rfadbeb000k7yc8.cn-hangzhou.personal.cr.aliyuncs.com
+  ACR_REGISTRY: crpi-48rfadbeb000k7yc8.cn-hangzhou.personal.cr.aliyuncs.com
   ACR_NAMESPACE: video2text
   IMAGE_NAME: video2text
 
@@ -27,7 +26,7 @@ jobs:
       - name: Login to Alibaba Cloud ACR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.ACR_LOGIN_REGISTRY }}
+          registry: ${{ env.ACR_REGISTRY }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
@@ -35,7 +34,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.ACR_PUSH_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.IMAGE_NAME }}
           tags: |
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
