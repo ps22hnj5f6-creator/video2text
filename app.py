@@ -5,6 +5,7 @@ import os
 import json
 import time
 import uuid
+import shutil
 import traceback
 import tempfile
 import threading
@@ -140,6 +141,7 @@ def _results_to_state(results: list) -> list[dict]:
 def _run_transcription_job(job_id, files, model_size, language, use_deepseek, deepseek_api_key):
     """在后台线程中执行转写，进度写入 JobManager"""
     results = []
+    local_paths = []  # 复制到应用临时目录的文件路径，避免 Gradio 清理后读不到
 
     def update_progress(step, total, desc, done=False):
         job_manager.update(
@@ -168,6 +170,17 @@ def _run_transcription_job(job_id, files, model_size, language, use_deepseek, de
             video_paths = [files]
         else:
             video_paths = [getattr(files, 'name', str(files))]
+
+        # Gradio 上传的临时文件会在前端请求结束后被清理，后台线程必须复制到本地再处理
+        for p in video_paths:
+            try:
+                dest = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{Path(p).name}")
+                shutil.copy2(p, dest)
+                local_paths.append(dest)
+            except Exception as copy_err:
+                print(f"[WARN] 复制上传文件失败 {p}: {copy_err}")
+                local_paths.append(p)  # fallback，后续让 ffmpeg/whisper 给出更明确错误
+        video_paths = local_paths
 
         titles = [Path(p).stem for p in video_paths]
         total_files = len(video_paths)
@@ -260,6 +273,15 @@ def _run_transcription_job(job_id, files, model_size, language, use_deepseek, de
         traceback.print_exc()
         update_progress(0, 1, f"❌ 处理出错: {e}", done=True)
         job_manager.set_done(job_id, _results_to_state(results), error=str(e))
+
+    finally:
+        # 清理复制到本地临时目录的视频副本
+        for p in local_paths:
+            try:
+                if os.path.exists(p):
+                    os.unlink(p)
+            except OSError:
+                pass
 
 
 def start_upload(files, model_size, language, use_deepseek, deepseek_api_key):
