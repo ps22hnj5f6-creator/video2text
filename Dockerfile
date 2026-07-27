@@ -17,9 +17,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # === 构建时预下载 faster-whisper base 模型 ===
-# 使用国内 HF 镜像，构建时直接下载到镜像内
-# 这样容器启动时不需要再下载，秒开
-ENV HF_ENDPOINT=https://hf-mirror.com
+# 构建环境（GitHub Actions）在海外，直接用 HuggingFace 官方源
+# 运行环境（Sealos/国内）需要国内镜像，通过运行时环境变量 HF_ENDPOINT 设置
 ENV HF_HOME=/app/hf_cache
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')" \
     && echo "模型预下载完成"
