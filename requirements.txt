@@ -2,6 +2,7 @@
 # 核心依赖
 faster-whisper>=1.0.0      # 语音转写引擎（比openai-whisper快4倍）
 gradio==4.44.0             # Web界面（锁定4.x稳定版，避免5.x/6.x API不兼容）
+huggingface_hub>=0.20.0,<0.25.0  # Gradio 4.x 依赖旧版 HfFolder API，新版会 ImportError
 
 # 音频处理
 imageio-ffmpeg>=0.4.0      # ffmpeg二进制（无需系统安装ffmpeg）
