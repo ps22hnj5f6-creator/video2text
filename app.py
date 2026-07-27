@@ -102,14 +102,11 @@ class JobManager:
 
 job_manager = JobManager()
 
-# 全局 Timer 引用（在 build_app 中赋值），用于任务结束后停用轮询，避免结果区"跳帧"
-_timer = None
-
 
 # ========== 核心处理逻辑 ==========
 
 def _progress_html(step: int, total: int, desc: str, done: bool = False) -> str:
-    """渲染单条自定义进度条 HTML"""
+    """渲染单条自定义进度条 HTML，同时显示百分比"""
     pct = 100 if done else (min(step / total, 1.0) * 100 if total else 0)
     color = "#22c55e" if done else "#4f46e5"
     desc_safe = desc.replace("\"", "&quot;").replace("<", "&lt;").replace(">", "&gt;")
@@ -117,13 +114,108 @@ def _progress_html(step: int, total: int, desc: str, done: bool = False) -> str:
     <div class="v2t-progress">
         <div class="v2t-progress-header">
             <span class="v2t-progress-desc">{desc_safe}</span>
-            <span class="v2t-progress-pct">{step}/{total}</span>
+            <span class="v2t-progress-pct">{pct:.0f}% ({step}/{total})</span>
         </div>
         <div class="v2t-progress-track">
             <div class="v2t-progress-bar" style="width:{pct:.1f}%; background:{color};"></div>
         </div>
     </div>
     """
+
+
+def _upload_progress_html(file_count: int, total_bytes: int, errors: int = 0) -> str:
+    """渲染上传完成后的进度条 HTML（文件已上传到 Gradio 临时目录后触发复制）"""
+    mb = total_bytes / (1024 * 1024)
+    pct = 100 if file_count > 0 else 0
+    bar_color = "#22c55e" if file_count > 0 else "#94a3b8"
+    error_html = ""
+    if errors:
+        error_html = f'<div style="color:#dc2626;font-size:12px;margin-top:6px;">⚠️ {errors} 个文件复制失败，请重新上传</div>'
+    return f"""
+    <div class="v2t-progress">
+        <div class="v2t-progress-header">
+            <span class="v2t-progress-desc">{"📤 文件已就绪" if file_count > 0 else "等待上传文件"}</span>
+            <span class="v2t-progress-pct">{pct:.0f}%</span>
+        </div>
+        <div class="v2t-progress-track">
+            <div class="v2t-progress-bar" style="width:{pct:.1f}%; background:{bar_color};"></div>
+        </div>
+        <div style="text-align:center;font-size:12px;color:#64748b;margin-top:6px;">
+            {f"已就绪 {file_count} 个文件，共 {mb:.1f} MB" if file_count > 0 else "请选择或拖拽视频文件到上方"}
+        </div>
+        {error_html}
+    </div>
+    """
+
+
+def _resolve_file_path(f) -> str:
+    """统一解析 Gradio 上传文件对象（兼容 str / FileData / dict 等多种返回）"""
+    if isinstance(f, str):
+        return f
+    if isinstance(f, dict):
+        return f.get("path") or f.get("name") or f.get("orig_name") or str(f)
+    for attr in ("name", "path", "orig_name"):
+        v = getattr(f, attr, None)
+        if isinstance(v, str):
+            return v
+    return str(f)
+
+
+def _cleanup_copies(items: list[dict], keep_paths: list[str] | None = None):
+    """清理不再需要的本地副本文件"""
+    keep = set(keep_paths or [])
+    for item in items:
+        p = item.get("copy")
+        if p and p not in keep and os.path.exists(p):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def on_files_change(files, current_items: list[dict]) -> tuple[str, list[dict]]:
+    """文件上传完成时立即复制到应用临时目录，避免请求结束后 Gradio 清理临时文件。
+
+    Gradio File 组件的 change 事件在文件上传到服务器临时目录后触发，
+    此时文件一定存在，立即复制到 TEMP_DIR 并记录副本路径，后续转写直接使用副本。
+    """
+    if not files:
+        _cleanup_copies(current_items)
+        return _upload_progress_html(0, 0), []
+
+    raw_files = files if isinstance(files, list) else [files]
+    new_origs = [_resolve_file_path(f) for f in raw_files]
+
+    # 保留仍存在的旧副本，避免重复复制
+    old_map = {item["orig"]: item.get("copy") for item in current_items if item.get("copy")}
+    new_items: list[dict] = []
+    for orig in new_origs:
+        copy_path = old_map.get(orig)
+        if copy_path and os.path.exists(copy_path):
+            new_items.append({"orig": orig, "copy": copy_path})
+        else:
+            try:
+                dest = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{Path(orig).name}")
+                shutil.copy2(orig, dest)
+                new_items.append({"orig": orig, "copy": dest})
+            except Exception as e:
+                print(f"[WARN] 复制上传文件失败 {orig}: {e}")
+                traceback.print_exc()
+                new_items.append({"orig": orig, "copy": None, "error": str(e)})
+
+    # 清理不再需要的旧副本
+    keep_paths = [item["copy"] for item in new_items if item.get("copy")]
+    _cleanup_copies(current_items, keep_paths=keep_paths)
+
+    total_bytes = sum(
+        os.path.getsize(item["copy"])
+        for item in new_items
+        if item.get("copy") and os.path.exists(item["copy"])
+    )
+    valid_count = sum(1 for item in new_items if item.get("copy"))
+    error_count = len(new_items) - valid_count
+
+    return _upload_progress_html(valid_count, total_bytes, error_count), new_items
 
 
 def _results_to_state(results: list) -> list[dict]:
@@ -272,50 +364,53 @@ def _run_transcription_job(job_id, video_paths, model_size, language, use_deepse
                 pass
 
 
-def start_upload(files, model_size, language, use_deepseek, deepseek_api_key):
-    """启动后台转写任务，返回 job_id"""
-    # 重新激活轮询 Timer（上一次任务结束后会被停用，避免结果区跳帧）
-    if _timer is not None:
-        _timer.active = True
+def start_upload(file_items, model_size, language, use_deepseek, deepseek_api_key):
+    """启动后台转写任务。
 
-    # 在请求还活着时就把 Gradio 临时文件复制到应用临时目录，
-    # 否则请求结束 Gradio 清理后，后台线程将读不到文件（批量上传尤其容易踩）
-    video_paths = []
-    if files:
-        def resolve_file_path(f):
-            if isinstance(f, str):
-                return f
-            if isinstance(f, dict):
-                return f.get("path") or f.get("name") or f.get("orig_name") or str(f)
-            for attr in ("name", "path", "orig_name"):
-                v = getattr(f, attr, None)
-                if isinstance(v, str):
-                    return v
-            return str(f)
+    file_items 由 on_files_change 在文件上传完成时生成，每项包含：
+      - orig: Gradio 临时文件原始路径
+      - copy: 已复制到 TEMP_DIR 的本地副本路径
 
-        raw = files if isinstance(files, list) else [files]
-        for f in raw:
-            p = resolve_file_path(f)
-            try:
-                dest = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{Path(p).name}")
-                shutil.copy2(p, dest)
-                video_paths.append(dest)
-            except Exception as e:
-                print(f"[WARN] 复制上传文件失败 {p}: {e}")
-                video_paths.append(p)
-
+    直接使用副本路径启动后台线程，避免请求生命周期结束后 Gradio 清理临时文件。
+    """
     job_id = job_manager.create()
+
+    video_paths = []
+    missing = []
+    for item in file_items or []:
+        copy_path = item.get("copy")
+        if copy_path and os.path.exists(copy_path):
+            video_paths.append(copy_path)
+        else:
+            missing.append(Path(item.get("orig", "未知文件")).name)
+
+    if missing:
+        err_msg = f"以下文件未找到本地副本，请重新上传：{', '.join(missing)}"
+        job_manager.set_done(job_id, [], error=err_msg)
+        progress_html = _progress_html(0, 1, err_msg, done=True)
+        return job_id, progress_html
+
+    if not video_paths:
+        err_msg = "请上传至少一个视频文件"
+        job_manager.set_done(job_id, [], error=err_msg)
+        return job_id, _progress_html(0, 1, err_msg, done=True)
+
     thread = threading.Thread(
         target=_run_transcription_job,
         args=(job_id, video_paths, model_size, language, use_deepseek, deepseek_api_key),
         daemon=True,
     )
     thread.start()
-    return job_id
+    return job_id, _progress_html(0, 1, "🚀 任务已启动，正在准备...")
 
 
 def check_status(job_id):
-    """定时轮询任务状态（短 HTTP 请求，不会被网关切断）"""
+    """定时轮询任务状态（短 HTTP 请求，不会被网关切断）。
+
+    返回 6 个值，最后一个是 Timer 的更新：
+      - 任务完成/出错时返回 gr.update(active=False)，真正停掉前端轮询，避免结果区"跳帧"
+      - 未完成时返回 gr.update()，保持 Timer 继续运行
+    """
     if not job_id:
         return (
             "<p style='color:#888; text-align:center; padding:12px;'>点击「开始转写」后在此显示进度</p>",
@@ -323,6 +418,7 @@ def check_status(job_id):
             "<p style='color:#888; text-align:center; padding:20px;'>暂无结果，请上传视频文件</p>",
             "",
             None,
+            gr.update(),
         )
 
     job = job_manager.get(job_id)
@@ -333,22 +429,15 @@ def check_status(job_id):
             "<p style='color:#888; text-align:center; padding:20px;'>暂无结果</p>",
             "",
             None,
+            gr.update(active=False),
         )
 
     progress_html = job.get("progress_html") or _progress_html(
         job.get("step", 0), job.get("total", 1), job.get("desc", "处理中..."), job.get("done", False)
     )
 
-    if job.get("error") or job.get("done"):
-        # 只渲染一次最终结果，之后停掉 Timer，避免每2秒重渲染导致"跳帧"
-        if job.get("rendered"):
-            return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-        job_manager.update(job_id, rendered=True)
-        if _timer is not None:
-            _timer.active = False
-
     if job.get("error"):
-        return progress_html, job.get("results", []), progress_html, "", None
+        return progress_html, job.get("results", []), progress_html, "", None, gr.update(active=False)
 
     if job.get("done"):
         results = [TranscriptResult(**r) for r in job.get("results", [])]
@@ -358,10 +447,11 @@ def check_status(job_id):
             format_results_table(results),
             format_results_text(results),
             generate_export_json(results),
+            gr.update(active=False),
         )
 
-    # 未完成：只更新进度，结果区保持原样
-    return progress_html, job.get("results", []), gr.update(), gr.update(), gr.update()
+    # 未完成：只更新进度，结果区保持原样，Timer 继续运行
+    return progress_html, job.get("results", []), gr.update(), gr.update(), gr.update(), gr.update()
 
 
 # ========== 结果格式化 ==========
@@ -867,6 +957,13 @@ def build_app():
                     file_types=[".mp4", ".mov", ".avi", ".webm", ".mkv", ".flv", ".3gp"],
                     type="filepath"
                 )
+                # 上传进度/就绪状态（File 组件上传完成后 change 事件更新）
+                upload_progress = gr.HTML(
+                    value=_upload_progress_html(0, 0),
+                    elem_classes="status-box"
+                )
+                # 已上传文件的本地副本路径（由 change 事件维护，start_upload 直接使用）
+                uploaded_files_state = gr.State(value=[])
                 upload_btn = gr.Button(
                     "🚀 开始转写",
                     variant="primary",
@@ -913,23 +1010,33 @@ def build_app():
                     gr.Markdown(FAQ_MD)
 
         # 事件绑定
-        # 1) 点击开始：启动后台线程，立即返回 job_id（短请求，不会被网关切断）
-        upload_btn.click(
-            fn=start_upload,
-            inputs=[file_input, model_size, language, use_deepseek, deepseek_api_key],
-            outputs=[job_id_state],
-            show_progress="hidden",
+        # 1) 文件上传完成后立即复制到应用临时目录，显示上传进度
+        file_input.change(
+            fn=on_files_change,
+            inputs=[file_input, uploaded_files_state],
+            outputs=[upload_progress, uploaded_files_state],
         )
 
-        # 2) 定时轮询：每 2 秒查询一次后台任务进度与结果
-        # Gradio 4.x Timer 参数名为 value（间隔秒数），不是 every
-        timer = gr.Timer(value=2.0, active=True)
-        global _timer
-        _timer = timer
+        # 2) 轮询 Timer：初始 inactive，点击开始后激活，任务完成后通过输出停掉
+        timer = gr.Timer(value=2.0, active=False)
+
+        # 3) 点击开始：启动后台线程，立即显示初始进度，然后激活 Timer
+        upload_btn.click(
+            fn=start_upload,
+            inputs=[uploaded_files_state, model_size, language, use_deepseek, deepseek_api_key],
+            outputs=[job_id_state, status_box],
+            show_progress="hidden",
+        ).then(
+            fn=lambda: gr.update(active=True),
+            outputs=[timer]
+        )
+
+        # 4) 定时轮询：每 2 秒查询一次后台任务进度与结果
+        # check_status 最后一个返回值控制 Timer active 状态，done/error 后真正停止轮询
         timer.tick(
             fn=check_status,
             inputs=[job_id_state],
-            outputs=[status_box, results_state, result_table, result_text, export_file],
+            outputs=[status_box, results_state, result_table, result_text, export_file, timer],
             queue=False,  # 未启用 app.queue()，避免走 WebSocket
         )
 
@@ -941,8 +1048,8 @@ def build_app():
             fn=clear_results,
             outputs=[result_table, result_text, export_file, status_box]
         ).then(
-            fn=lambda: "",
-            outputs=[job_id_state]
+            fn=lambda: ("", gr.update(active=False)),
+            outputs=[job_id_state, timer]
         )
 
     return app
