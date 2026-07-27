@@ -10,7 +10,8 @@ RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ffmpeg -version | head -1
 
 # === Python 依赖 ===
 COPY requirements.txt .

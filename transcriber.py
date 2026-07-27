@@ -26,17 +26,17 @@ class TranscriptResult:
 
 def get_ffmpeg_path() -> str:
     """获取 ffmpeg 可执行文件路径"""
-    # 优先用 imageio-ffmpeg 自带的
+    # 优先用系统 PATH 里的（Docker 中 apt 安装的 /usr/bin/ffmpeg 解码器更全、更稳定）
+    result = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
+    if result.returncode == 0:
+        return result.stdout.strip()
+
+    # fallback：用 imageio-ffmpeg 自带的静态二进制
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
     except ImportError:
         pass
-
-    # 其次用系统 PATH 里的
-    result = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
-    if result.returncode == 0:
-        return result.stdout.strip()
 
     raise RuntimeError(
         "ffmpeg 未找到！请安装：\n"
@@ -55,7 +55,10 @@ def extract_audio(video_path: str, output_path: str = None, ffmpeg_path: str = N
         output_path = tempfile.mktemp(suffix=".wav")
 
     cmd = [
-        ffmpeg_path, "-i", video_path,
+        ffmpeg_path,
+        "-hide_banner",       # 隐藏版本/配置 banner，避免真正错误被淹没
+        "-nostdin",           # 非交互式运行，防止 stdin 导致挂起
+        "-i", video_path,
         "-vn",                # 不要视频
         "-acodec", "pcm_s16le",  # 16bit PCM
         "-ar", "16000",       # 16kHz采样率
@@ -66,7 +69,13 @@ def extract_audio(video_path: str, output_path: str = None, ffmpeg_path: str = N
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg 音频提取失败: {result.stderr[:500]}")
+        # 完整 stderr 写入日志以便排查；向用户展示最后几行真正的错误
+        err_full = (result.stderr or "").strip()
+        print(f"[ERROR] ffmpeg 音频提取失败\n命令: {' '.join(cmd)}\nstderr:\n{err_full}")
+        # 取最后非空行作为摘要（通常是真正原因）
+        err_lines = [ln for ln in err_full.splitlines() if ln.strip()]
+        err_summary = err_lines[-1] if err_lines else "未知错误"
+        raise RuntimeError(f"ffmpeg 音频提取失败: {err_summary}")
 
     return output_path
 
@@ -77,7 +86,8 @@ def get_video_duration(video_path: str, ffmpeg_path: str = None) -> float:
         ffmpeg_path = get_ffmpeg_path()
 
     cmd = [
-        ffmpeg_path, "-i", video_path,
+        ffmpeg_path, "-hide_banner", "-nostdin",
+        "-i", video_path,
         "-f", "null", "-"
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
