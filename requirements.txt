@@ -1,7 +1,7 @@
 # 短视频批量转文字 - 依赖清单
 # 核心依赖
 faster-whisper>=1.0.0      # 语音转写引擎（比openai-whisper快4倍）
-gradio>=4.0.0              # Web界面
+gradio>=4.44.0,<6.0        # Web界面（Timer 组件稳定 API）
 
 # 音频处理
 imageio-ffmpeg>=0.4.0      # ffmpeg二进制（无需系统安装ffmpeg）

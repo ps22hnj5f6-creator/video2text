@@ -869,11 +869,13 @@ def build_app():
         )
 
         # 2) 定时轮询：每 2 秒查询一次后台任务进度与结果
-        timer = gr.Timer(every=2.0, active=True)
+        # Gradio 4.x Timer 参数名为 value（间隔秒数），不是 every
+        timer = gr.Timer(value=2.0, active=True)
         timer.tick(
             fn=check_status,
             inputs=[job_id_state],
-            outputs=[status_box, results_state, result_table, result_text, export_file]
+            outputs=[status_box, results_state, result_table, result_text, export_file],
+            queue=False,  # 未启用 app.queue()，避免走 WebSocket
         )
 
         export_txt_btn.click(fn=export_txt_from_state, outputs=export_file)
