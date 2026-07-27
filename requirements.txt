@@ -4,6 +4,10 @@ faster-whisper>=1.0.0      # 语音转写引擎（比openai-whisper快4倍）
 gradio==4.44.0             # Web界面（锁定4.x稳定版，避免5.x/6.x API不兼容）
 huggingface_hub>=0.20.0,<0.25.0  # Gradio 4.x 依赖旧版 HfFolder API，新版会 ImportError
 pydantic==2.10.6            # 修复 gradio_client json_schema 解析布尔 schema 报错（TypeError: bool is not iterable）
+starlette==0.37.2           # Gradio 4.44 用老版 TemplateResponse(name, ctx) 签名，新版 Starlette(>=0.40)改签名会崩
+fastapi==0.111.0            # 与 starlette 0.37.2 配套，避免 TemplateResponse 签名不匹配
+jinja2==3.1.4               # 与 starlette 0.37.2 兼容
+markupsafe==2.0.1           # gradio 4.44 要求 markupsafe~=2.0
 
 # 音频处理
 imageio-ffmpeg>=0.4.0      # ffmpeg二进制（无需系统安装ffmpeg）
