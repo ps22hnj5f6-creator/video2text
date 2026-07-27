@@ -1,103 +1,87 @@
 #!/usr/bin/env bash
-# === video2text 一键构建 + 推送阿里云 ACR + Sealos 部署指南 ===
+# === video2text 一键部署到 Sealos（使用 GHCR 镜像）===
 set -e
 
 # =============================================
 # ⚙️ 配置区 —— 改这里就行
 # =============================================
-ACR_REGION="cn-hangzhou"            # 华东1（杭州）
-ACR_NAMESPACE="video2text"          # ACR 命名空间（需提前在 ACR 控制台创建）
+GHCR_USER="ps22hnj5f6-creator"      # GitHub 用户名 / 组织名
 IMAGE_NAME="video2text"             # 镜像名
 IMAGE_TAG="latest"                  # 镜像标签
-ACR_REGISTRY="${ACR_REGION}.aliyuncs.com"  # ACR 仓库地址
+FULL_IMAGE="ghcr.io/${GHCR_USER}/${IMAGE_NAME}:${IMAGE_TAG}"
 
-# 完整镜像地址（Sealos 部署时用这个）
-FULL_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}"
+# 应用资源（根据实际流量调整）
+CPU_REQUEST="1"
+CPU_LIMIT="2"
+MEMORY_REQUEST="2Gi"
+MEMORY_LIMIT="4Gi"
+
+# Sealos 上的应用名
+APP_NAME="video2text"
 
 echo "========================================="
-echo "  video2text 构建 & 推送"
+echo "  video2text Sealos 部署脚本"
 echo "========================================="
 echo "镜像地址: ${FULL_IMAGE}"
 echo ""
 
 # =============================================
-# Step 1: 构建 Docker 镜像
+# Step 1: 确认 sealos CLI 已登录
 # =============================================
-echo "[1/3] 构建 Docker 镜像..."
-docker build -t "${FULL_IMAGE}" .
-
-echo "✅ 构建完成"
-
-# =============================================
-# Step 2: 登录阿里云 ACR & 推送
-# =============================================
-echo "[2/3] 推送到阿里云 ACR..."
-echo "请输入阿里云 ACR 登录密码（在 ACR 控制台 > 访问凭证 > 设置固定密码）："
-docker login "${ACR_REGISTRY}"
-
-docker push "${FULL_IMAGE}"
-echo "✅ 推送完成"
+if ! command -v sealos &> /dev/null; then
+    echo "⚠️ 未检测到 sealos CLI，下面提供手动部署 YAML。"
+    echo "   如需自动部署，请先安装 sealos CLI 并登录："
+    echo "   https://sealos.io/docs/self-hosting/lifecycle-management/"
+fi
 
 # =============================================
-# Step 3: Sealos 部署指南
+# Step 2: 输出 Deployment YAML
 # =============================================
 echo ""
 echo "========================================="
-echo "  🎉 部署到 Sealos"
+echo "  🎉 Kubernetes 部署 YAML"
 echo "========================================="
 echo ""
-echo "镜像已推送到: ${FULL_IMAGE}"
+echo "复制以下内容到 Sealos 终端（kubectl apply -f）即可部署/更新："
 echo ""
-echo "=== Sealos 部署步骤 ==="
-echo ""
-echo "方式 A —— Sealos Web UI（最简单）："
-echo "  1. 登录 Sealos 公有云: https://cloud.sealos.io"
-echo "  2. 进入「应用管理」>「应用部署」"
-echo "  3. 填写："
-echo "     - 镜像地址: ${FULL_IMAGE}"
-echo "     - 容器端口: 7860"
-echo "     - CPU: 2核（最低1核，推荐2核保证转写速度）"
-echo "     - 内存: 4GB（模型+转写约1.5GB，建议4GB留余量）"
-echo "     - 网络: 开启「公网访问」，Sealos自动分配域名"
-echo "  4. 点「部署」，等30秒容器启动"
-echo "  5. 访问 Sealos 分配的公网域名即可使用"
-echo ""
-echo "方式 B —— Sealos 终端 (kubectl)："
-echo "  1. 登录 Sealos，打开「终端」"
-echo "  2. 粘贴以下 YAML："
-echo ""
-cat <<'EOF'
+
+cat <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: video2text
+  name: ${APP_NAME}
   labels:
-    app: video2text
+    app: ${APP_NAME}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: video2text
+      app: ${APP_NAME}
   template:
     metadata:
       labels:
-        app: video2text
+        app: ${APP_NAME}
     spec:
       containers:
-      - name: video2text
+      - name: ${APP_NAME}
         image: ${FULL_IMAGE}
+        imagePullPolicy: Always
         ports:
         - containerPort: 7860
         resources:
           requests:
-            cpu: "1"
-            memory: "2Gi"
+            cpu: "${CPU_REQUEST}"
+            memory: "${MEMORY_REQUEST}"
           limits:
-            cpu: "2"
-            memory: "4Gi"
+            cpu: "${CPU_LIMIT}"
+            memory: "${MEMORY_LIMIT}"
         env:
         - name: HF_ENDPOINT
           value: "https://hf-mirror.com"
+        - name: GRADIO_SERVER_NAME
+          value: "0.0.0.0"
+        - name: GRADIO_SERVER_PORT
+          value: "7860"
         livenessProbe:
           httpGet:
             path: /
@@ -114,36 +98,28 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: video2text-service
+  name: ${APP_NAME}-service
 spec:
   selector:
-    app: video2text
+    app: ${APP_NAME}
   ports:
   - port: 7860
     targetPort: 7860
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: video2text-ingress
-spec:
-  rules:
-  - http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: video2text-service
-            port:
-              number: 7860
 EOF
 
 echo ""
-echo "=== ACR 配置提醒 ==="
-echo "  如果还没创建 ACR 命名空间："
-echo "  登录 https://cr.console.aliyun.com"
-echo "  > 命名空间 > 创建命名空间: ${ACR_NAMESPACE}"
+echo "========================================="
+echo "  Sealos Web UI 快速部署步骤"
+echo "========================================="
+echo ""
+echo "1. 登录 Sealos 公有云: https://cloud.sealos.io"
+echo "2. 进入「应用管理」> 找到已部署的 ${APP_NAME}"
+echo "3. 点击「重新部署」或「更新」"
+echo "4. 镜像地址填写: ${FULL_IMAGE}"
+echo "5. 容器端口: 7860"
+echo "6. 环境变量确认包含: HF_ENDPOINT=https://hf-mirror.com"
+echo "7. 点击「部署/更新」，等待 30-60 秒容器启动"
+echo "8. 访问 Sealos 分配的公网域名即可使用"
 echo ""
 echo "========================================="
 echo "  完成！有问题随时问我"
