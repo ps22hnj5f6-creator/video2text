@@ -131,40 +131,84 @@ def process_uploaded_files(files, model_size, language, progress=gr.Progress()):
 
 def format_results_table(results: list) -> str:
     if not results:
-        return "<p>暂无结果</p>"
+        return "<p style='color:#888; text-align:center; padding:20px;'>暂无结果</p>"
 
-    html = """<table style="width:100%; border-collapse:collapse; font-size:14px;">
-    <tr style="background:#f0f0f0; font-weight:bold;">
-        <th style="padding:8px; border:1px solid #ddd; width:5%;">#</th>
-        <th style="padding:8px; border:1px solid #ddd; width:25%;">标题/来源</th>
-        <th style="padding:8px; border:1px solid #ddd; width:8%;">时长</th>
-        <th style="padding:8px; border:1px solid #ddd; width:8%;">字数</th>
-        <th style="padding:8px; border:1px solid #ddd; width:44%;">转写内容</th>
-        <th style="padding:8px; border:1px solid #ddd; width:8%;">状态</th>
-    </tr>"""
+    total = len(results)
+    success = sum(1 for r in results if not r.error)
+    failed = total - success
+
+    # 紧凑表头统计
+    html = f"""
+    <div class="result-summary">
+        共 {total} 条 | ✅ 成功 {success} 条 | ❌ 失败 {failed} 条
+    </div>
+    <div class="result-table-inner">
+    <table class="compact-result-table">
+    <thead>
+    <tr>
+        <th style="width:28px;">#</th>
+        <th style="width:25%;">标题</th>
+        <th style="width:45px;">时长</th>
+        <th style="width:45px;">字数</th>
+        <th>内容预览</th>
+        <th style="width:36px;">状态</th>
+    </tr>
+    </thead>
+    <tbody>
+    """
 
     for i, r in enumerate(results):
         status = "✅" if not r.error else "❌"
-        content = r.text[:200] + "..." if len(r.text) > 200 else r.text
         if r.error:
-            content = f"<span style='color:red'>{r.error}</span>"
+            content = f"<span style='color:#dc2626; font-size:12px;'>{r.error}</span>"
+        else:
+            content = r.text[:80] + "..." if len(r.text) > 80 else (r.text or "-")
+            # 高亮常见金融关键词
+            content = _highlight_finance_terms(content)
+
         duration_str = f"{r.duration:.1f}s" if r.duration > 0 else "-"
         word_count = len(r.text) if r.text else 0
         source = r.title or r.source[:50]
 
-        bg = "#fff" if i % 2 == 0 else "#f9f9f9"
+        row_class = "error" if r.error else ""
         html += f"""
-    <tr style="background:{bg};">
-        <td style="padding:6px; border:1px solid #ddd; text-align:center;">{i+1}</td>
-        <td style="padding:6px; border:1px solid #ddd;">{source}</td>
-        <td style="padding:6px; border:1px solid #ddd; text-align:center;">{duration_str}</td>
-        <td style="padding:6px; border:1px solid #ddd; text-align:center;">{word_count}</td>
-        <td style="padding:6px; border:1px solid #ddd;">{content}</td>
-        <td style="padding:6px; border:1px solid #ddd; text-align:center;">{status}</td>
+    <tr class="{row_class}">
+        <td class="idx">{i+1}</td>
+        <td class="title" title="{source}">{source}</td>
+        <td class="num">{duration_str}</td>
+        <td class="num">{word_count}</td>
+        <td class="preview">{content}</td>
+        <td class="status">{status}</td>
     </tr>"""
 
-    html += "</table>"
+    html += """
+    </tbody>
+    </table>
+    </div>
+    """
     return html
+
+
+def _highlight_finance_terms(text: str) -> str:
+    """在预览中高亮常见金融术语，便于快速扫读"""
+    import re
+    terms = [
+        "主线", "资金", "扎堆", "板块", "版块", "科技", "医药", "券商", "消费",
+        "满仓", "空仓", "半仓", "止损", "止盈", "融资", "融券", "量化",
+        "大盘", "创业板", "科创板", "北交所", "A股", "港股", "美股",
+        "涨停", "跌停", "拉升", "回调", "调整", "震荡", "放量", "缩量",
+        "尾盘", "开盘", "收盘", "成交量", "换手率", "K线", "均线",
+        "北向资金", "南向资金", "机构", "游资", "主力", "外资", "内资",
+        "龙虎榜", "大宗交易", "IPO", "定增", "配股", "转债",
+    ]
+    pattern = "|".join(re.escape(t) for t in terms)
+    if not pattern:
+        return text
+    return re.sub(
+        f"({pattern})",
+        r'<span class="fin-term">\1</span>',
+        text
+    )
 
 
 def format_results_text(results: list) -> str:
@@ -362,6 +406,94 @@ CUSTOM_CSS = """
     overflow-x: auto;
 }
 
+/* 紧凑结果表 */
+.result-summary {
+    text-align: center;
+    color: #666;
+    font-size: 13px;
+    margin-bottom: 10px;
+}
+
+.result-table-inner {
+    max-height: 360px;
+    overflow-y: auto;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    background: #fff;
+}
+
+.compact-result-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.compact-result-table thead {
+    position: sticky;
+    top: 0;
+    background: #f8fafc;
+    z-index: 1;
+}
+
+.compact-result-table th {
+    padding: 8px 6px;
+    font-weight: 600;
+    color: #475569;
+    border-bottom: 1px solid #e2e8f0;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.compact-result-table td {
+    padding: 6px;
+    border-bottom: 1px solid #f1f5f9;
+    vertical-align: top;
+}
+
+.compact-result-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.compact-result-table tbody tr:nth-child(even) {
+    background: #fafafa;
+}
+
+.compact-result-table tbody tr.error {
+    background: #fef2f2;
+}
+
+.compact-result-table td.idx,
+.compact-result-table td.num,
+.compact-result-table td.status {
+    text-align: center;
+    color: #64748b;
+}
+
+.compact-result-table td.title {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.compact-result-table td.preview {
+    color: #334155;
+    line-height: 1.5;
+}
+
+.compact-result-table .fin-term {
+    color: #0369a1;
+    font-weight: 600;
+    background: #f0f9ff;
+    padding: 1px 3px;
+    border-radius: 3px;
+}
+
+/* 导出文件组件 */
+.export-file .file-preview {
+    margin-top: 8px;
+}
+
 /* 配置区紧凑 */
 .config-row {
     margin-bottom: 8px !important;
@@ -446,9 +578,9 @@ def build_app():
                     export_txt_btn = gr.Button("📄 导出 TXT")
                     export_json_btn = gr.Button("📦 导出 JSON")
                     export_excel_btn = gr.Button("📊 导出 Excel")
-                    clear_btn = gr.Button("🗑️ 清空结果", variant="secondary")
+                    clear_btn = gr.Button("🗑️ 清空", variant="secondary")
 
-                export_file = gr.File(label="导出文件")
+                export_file = gr.File(label="导出文件", elem_classes="export-file")
 
             # 使用说明
             with gr.Column(elem_classes="main-card"):
