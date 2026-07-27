@@ -19,6 +19,15 @@ MEMORY_LIMIT="4Gi"
 # Sealos 上的应用名
 APP_NAME="video2text"
 
+# =============================================
+# DeepSeek API Key（通过环境变量注入，不写死在仓库里）
+# 用法二选一：
+#   1) 运行本脚本前先 export DEEPSEEK_API_KEY=sk-xxx，生成的 YAML 会自动带上；
+#   2) 或在 Sealos 应用的环境变量里直接配置 DEEPSEEK_API_KEY（推荐，持久且安全）。
+# 注意：此前聊天中贴出的 Key 已暴露，建议去 https://platform.deepseek.com 重置。
+# =============================================
+DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
+
 echo "========================================="
 echo "  video2text Sealos 部署脚本"
 echo "========================================="
@@ -78,6 +87,8 @@ spec:
         env:
         - name: HF_ENDPOINT
           value: "https://hf-mirror.com"
+        - name: DEEPSEEK_API_KEY
+          value: "${DEEPSEEK_API_KEY}"
         - name: GRADIO_SERVER_NAME
           value: "0.0.0.0"
         - name: GRADIO_SERVER_PORT

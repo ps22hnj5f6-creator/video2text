@@ -121,13 +121,13 @@ def process_uploaded_files(files, model_size, language, use_deepseek, deepseek_a
 
             results.append(r)
 
-        # DeepSeek 后处理（批量清理）
-        if use_deepseek and deepseek_api_key and deepseek_api_key.strip():
+        # DeepSeek 后处理（批量清理）—— 默认开启，key 从环境变量/输入框读取
+        if use_deepseek:
             current_step += 1
             progress(current_step / total_steps, desc="🧹 DeepSeek 正在清理重复与错词...")
-            api_key = deepseek_api_key.strip()
-            # 优先读取环境变量中的 key（线上部署更安全）
-            if api_key == "${DEEPSEEK_API_KEY}" or api_key.startswith("$"):
+            api_key = (deepseek_api_key or "").strip()
+            # 输入框为空时，自动回退到部署环境变量（线上默认内嵌）
+            if not api_key or api_key.startswith("$"):
                 api_key = os.getenv("DEEPSEEK_API_KEY", "")
             if api_key:
                 try:
@@ -141,7 +141,7 @@ def process_uploaded_files(files, model_size, language, use_deepseek, deepseek_a
                     print(f"[WARN] DeepSeek 后处理失败: {e}")
                     traceback.print_exc()
             else:
-                print("[WARN] 已启用 DeepSeek 但 API key 为空")
+                print("[WARN] 已启用 DeepSeek 但 API key 为空（未设置 DEEPSEEK_API_KEY 且输入框未填）")
 
         state.results = results
         progress(1.0, desc="全部完成！")
@@ -568,27 +568,27 @@ def build_app():
                     info="zh=中文, en=英文, auto=自动检测（稍慢）"
                 )
 
-            # DeepSeek 后处理配置
+            # DeepSeek 后处理配置（默认开启，key 由部署环境变量提供）
             with gr.Column(elem_classes="main-card"):
                 with gr.Row(equal_height=True):
                     use_deepseek = gr.Checkbox(
                         label="✨ 使用 DeepSeek 后处理",
-                        value=False,
-                        info="清理末尾重复、纠正同音错别字和金融术语（推荐开启）",
+                        value=True,
+                        info="清理末尾重复、纠正同音错别字和金融术语（默认开启）",
                     )
                     deepseek_api_key = gr.Textbox(
                         label="DeepSeek API Key",
-                        placeholder="sk-...  或线上部署时留空，从环境变量 DEEPSEEK_API_KEY 读取",
-                        value="",
+                        placeholder="sk-...  或留空，自动使用服务器环境变量 DEEPSEEK_API_KEY",
+                        value=os.getenv("DEEPSEEK_API_KEY", ""),
                         type="password",
                         max_lines=1,
                         show_label=True,
-                        info="Key 仅用于本次请求，不会保存到服务器",
+                        info="部署端已内嵌默认 Key，本地运行可在此覆盖或留空用环境变量",
                     )
                 gr.Markdown(
                     "<p style='margin:0; color:#888; font-size:12px;'>"
                     "没有 Key？前往 <a href='https://platform.deepseek.com' target='_blank'>DeepSeek 开放平台</a> 申请；"
-                    "线上部署建议在 Sealos 环境变量中设置 <code>DEEPSEEK_API_KEY</code>。</p>"
+                    "线上部署已通过环境变量 <code>DEEPSEEK_API_KEY</code> 内嵌默认 Key，开箱即用。</p>"
                 )
 
             # 上传区

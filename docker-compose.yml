@@ -10,6 +10,9 @@ services:
       - hf_cache:/app/hf_cache       # 模型缓存持久化
     environment:
       - HF_ENDPOINT=https://hf-mirror.com
+      # DeepSeek 后处理 Key：从宿主机环境变量读取（不写死在仓库里）
+      # 本地运行前先：export DEEPSEEK_API_KEY=sk-xxx  再 docker compose up
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       # 腾讯云ASR备用（可选）
       # - TENCENT_SECRET_ID=your_id
       # - TENCENT_SECRET_KEY=your_key
