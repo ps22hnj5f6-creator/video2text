@@ -93,21 +93,22 @@ def get_video_duration(video_path: str, ffmpeg_path: str = None) -> float:
 class WhisperTranscriber:
     """使用 faster-whisper 进行语音转写"""
 
-    # 中文金融场景的提示词 —— 让 Whisper 输出标点 + 减少金融术语错别字
+    # 中文金融场景的提示词 —— 只列术语，不要带"指令句"，否则会被模型读出来
     ZH_FINANCE_PROMPT = (
-        "以下是普通话的句子，带有标点符号。"
-        "对于股票、基金、期货、债券、证券、A股、港股、美股、"
+        "普通话财经直播录音，带标点符号。"
+        "股票、基金、期货、债券、证券、A股、港股、美股、"
         "涨停、跌停、大盘、创业板、科创板、北交所、"
         "成交量、换手率、均线、K线、MACD、市盈率、市净率、"
         "打板、龙头、连板、板块、轮动、题材、热点、"
-        "仓位、止损、止盈、融资、融券、量化、打新、"
-        "北向资金、南向资金、外资、内资、机构、游资、"
+        "仓位、满仓、空仓、半仓、止损、止盈、融资、融券、量化、打新、"
+        "北向资金、南向资金、外资、内资、机构、游资、主力、"
         "分红、除权、除息、复权、龙虎榜、大宗交易、"
         "沪深300、中证500、上证50、上证指数、深证成指、"
         "注册制、退市、IPO、定增、配股、转债、"
-        "基金经理、基金经理、投顾、券商、银行、保险、"
-        "宏观数据、GDP、CPI、PMI、M2、降息、加息、"
-        "请准确识别以上金融术语，不要写错。"
+        "券商、银行、保险、基金、投顾、"
+        "宏观、GDP、CPI、PMI、M2、降息、加息、"
+        "开盘、收盘、尾盘、拉升、回调、调整、震荡、放量、缩量、"
+        "主线、资金、扎堆、核心、思路、粉丝、直播、"
     )
 
     # 常见 Whisper 中文错别字纠正映射
@@ -141,6 +142,16 @@ class WhisperTranscriber:
         "退市市": "退市",
         "IPOO": "IPO",
         "GDPD": "GDP", "CPIC": "CPI", "PMIP": "PMI",
+        # 财经口语常见错词补充
+        "围盘": "尾盘", "委盘": "尾盘", "维盘": "尾盘",
+        "版块": "板块", "板快": "板块",
+        "卖人一步": "慢人一步", "慢人一步": "慢人一步",
+        "扎堆": "扎堆", "满仓": "满仓",
+        "冲近来": "冲进来", "冲进莱": "冲进来",
+        "思路": "思路", "主现": "主线", "主线线": "主线",
+        "开播": "开播", "直播": "直播", "粉丝": "粉丝",
+        "拉升": "拉升", "回调": "回调", "震荡": "震荡",
+        "放量": "放量", "缩量": "缩量",
     }
 
     def __init__(self, model_size: str = "base", device: str = "cpu",
@@ -190,6 +201,38 @@ class WhisperTranscriber:
         text = re.sub(r'([，])\1+', r'\1', text)       # 逗号不重复
         return text
 
+    def _dedup_trailing_repeat(self, text: str, max_repeat: int = 2) -> str:
+        """去除转写中连续重复的句子（Whisper 幻觉/循环生成）
+
+        按标点分句后，如果同一句连续出现超过 max_repeat 次，只保留前 max_repeat 次。
+        主要解决音频末尾静音导致的"我们7月7日"无限循环问题。
+        """
+        import re
+        # 用标点切分，保留标点
+        parts = re.split(r'([。！？，])', text)
+        sentences = []
+        for i in range(0, len(parts) - 1, 2):
+            s = parts[i].strip()
+            punct = parts[i + 1] if i + 1 < len(parts) else ""
+            if s:
+                sentences.append((s, punct))
+
+        result = []
+        prev = None
+        count = 0
+        for s, punct in sentences:
+            if s == prev:
+                count += 1
+                if count > max_repeat:
+                    # 超过阈值，视为幻觉，跳过
+                    continue
+            else:
+                prev = s
+                count = 1
+            result.append(s + punct)
+
+        return "".join(result).strip()
+
     def prepare_audio(self, video_path: str) -> tuple:
         """提取音频并获取时长（单独步骤，用于进度跟踪）"""
         duration = get_video_duration(video_path)
@@ -217,12 +260,20 @@ class WhisperTranscriber:
             beam_size=5,
             best_of=5,
             temperature=0.0,
-            condition_on_previous_text=True,
+            # condition_on_previous_text=True 会让模型基于自身上一段续写，
+            # 在音频末尾静音时极易陷入"我们7月7日"循环，改为 False 切断循环
+            condition_on_previous_text=False,
+            # 更激进的幻觉拦截：压缩比阈值调低（默认2.4），重复度高的段落会被判定为幻觉并重试
+            compression_ratio_threshold=1.8,
+            # 平均对数概率阈值调高（默认-1.0），低置信度段落直接丢弃
+            log_prob_threshold=-0.8,
             no_speech_threshold=0.6,
             vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=300,
-                threshold=0.5
+                threshold=0.5,
+                # 静音超过2秒直接跳过，避免末尾长静音触发幻觉
+                min_speech_duration_ms=100,
             ),
             word_timestamps=True,
         )
@@ -256,6 +307,9 @@ class WhisperTranscriber:
         # 句末补句号
         if full_text and not full_text.endswith(("。", "！", "？", ".", "!", "?")):
             full_text += "。"
+
+        # 末尾循环重复兜底（模型参数拦截后仍可能残留）
+        full_text = self._dedup_trailing_repeat(full_text)
 
         # 错别字纠正
         full_text = self._correct_typos(full_text)
