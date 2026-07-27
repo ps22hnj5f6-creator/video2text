@@ -7,7 +7,12 @@ set -e
 # =============================================
 GHCR_USER="ps22hnj5f6-creator"      # GitHub 用户名 / 组织名
 IMAGE_NAME="video2text"             # 镜像名
-IMAGE_TAG="latest"                  # 镜像标签
+
+# 镜像标签：默认使用 "main-<当前 git 短 hash>"，避免 latest 缓存问题
+# 如需回退 latest，可将下面三行改为：IMAGE_TAG="latest"
+GIT_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo "latest")"
+GIT_BRANCH="$(git branch --show-current 2>/dev/null || echo "main")"
+IMAGE_TAG="${GIT_BRANCH}-${GIT_HASH}"
 FULL_IMAGE="ghcr.io/${GHCR_USER}/${IMAGE_NAME}:${IMAGE_TAG}"
 
 # 应用资源（根据实际流量调整）
@@ -32,6 +37,8 @@ echo "========================================="
 echo "  video2text Sealos 部署脚本"
 echo "========================================="
 echo "镜像地址: ${FULL_IMAGE}"
+echo "提示: 使用 commit hash 标签可避免 'latest' 缓存导致旧镜像运行"
+echo "      如需强制使用 latest，请手动修改 IMAGE_TAG 变量"
 echo ""
 
 # =============================================
@@ -127,6 +134,7 @@ echo "1. 登录 Sealos 公有云: https://cloud.sealos.io"
 echo "2. 进入「应用管理」> 找到已部署的 ${APP_NAME}"
 echo "3. 点击「重新部署」或「更新」"
 echo "4. 镜像地址填写: ${FULL_IMAGE}"
+echo "   （注意：不要用 latest，Sealos 节点可能缓存旧镜像）"
 echo "5. 容器端口: 7860"
 echo "6. 环境变量确认包含: HF_ENDPOINT=https://hf-mirror.com"
 echo "7. 点击「部署/更新」，等待 30-60 秒容器启动"
