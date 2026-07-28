@@ -190,62 +190,32 @@ def _copy_file_chunked(src: str, dst: str, chunk_size: int = 1024 * 1024):
 MAX_UPLOAD_TOTAL_MB = 500
 
 
-def on_files_change(files, current_items: list[dict]) -> tuple[str, list[dict]]:
-    """文件上传完成时立即复制到应用临时目录，避免请求结束后 Gradio 清理临时文件。
+def on_files_change(files, current_paths: list[str]) -> tuple[str, list[str]]:
+    """文件上传完成时记录原始路径，不立即复制。
 
-    Gradio File 组件的 change 事件在文件上传到服务器临时目录后触发，
-    此时文件一定存在，立即复制到 TEMP_DIR 并记录副本路径，后续转写直接使用副本。
+    之前在这里复制大文件会阻塞 Gradio 主线程，导致 Docker HEALTHCHECK 超时、
+    容器被判定不健康而重启。复制操作改为在后台线程 _run_transcription_job 的
+    第一行立即执行，此时原始文件仍然可被读取。
     """
     if not files:
-        _cleanup_copies(current_items)
         return _upload_progress_html(0, 0), []
 
     raw_files = files if isinstance(files, list) else [files]
-    new_origs = [_resolve_file_path(f) for f in raw_files]
+    new_paths = [_resolve_file_path(f) for f in raw_files]
 
     # 检查总大小，避免触发网关/容器内存问题
-    existing_origs = [p for p in new_origs if os.path.exists(p)]
-    total_input_bytes = sum(os.path.getsize(p) for p in existing_origs)
+    existing_paths = [p for p in new_paths if os.path.exists(p)]
+    total_input_bytes = sum(os.path.getsize(p) for p in existing_paths)
     print(
-        f"[UPLOAD] change event: {len(new_origs)} file(s), "
+        f"[UPLOAD] change event: {len(new_paths)} file(s), "
         f"total {total_input_bytes / (1024 * 1024):.1f} MB"
     )
     if total_input_bytes > MAX_UPLOAD_TOTAL_MB * 1024 * 1024:
         err_msg = f"单次上传总大小超过 {MAX_UPLOAD_TOTAL_MB} MB 限制，请分批上传或减少文件大小"
         print(f"[UPLOAD] {err_msg}")
-        return _upload_progress_html(0, total_input_bytes, error_msg=err_msg), current_items
+        return _upload_progress_html(0, total_input_bytes, error_msg=err_msg), []
 
-    # 保留仍存在的旧副本，避免重复复制
-    old_map = {item["orig"]: item.get("copy") for item in current_items if item.get("copy")}
-    new_items: list[dict] = []
-    for orig in new_origs:
-        copy_path = old_map.get(orig)
-        if copy_path and os.path.exists(copy_path):
-            new_items.append({"orig": orig, "copy": copy_path})
-        else:
-            try:
-                dest = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{Path(orig).name}")
-                _copy_file_chunked(orig, dest)
-                new_items.append({"orig": orig, "copy": dest})
-                print(f"[UPLOAD] copied {Path(orig).name} -> {dest}")
-            except Exception as e:
-                print(f"[WARN] 复制上传文件失败 {orig}: {e}")
-                traceback.print_exc()
-                new_items.append({"orig": orig, "copy": None, "error": str(e)})
-
-    # 清理不再需要的旧副本
-    keep_paths = [item["copy"] for item in new_items if item.get("copy")]
-    _cleanup_copies(current_items, keep_paths=keep_paths)
-
-    total_bytes = sum(
-        os.path.getsize(item["copy"])
-        for item in new_items
-        if item.get("copy") and os.path.exists(item["copy"])
-    )
-    valid_count = sum(1 for item in new_items if item.get("copy"))
-    error_count = len(new_items) - valid_count
-
-    return _upload_progress_html(valid_count, total_bytes, error_count), new_items
+    return _upload_progress_html(len(existing_paths), total_input_bytes), new_paths
 
 
 def _results_to_state(results: list) -> list[dict]:
@@ -263,13 +233,15 @@ def _results_to_state(results: list) -> list[dict]:
     ]
 
 
-def _run_transcription_job(job_id, video_paths, model_size, language, use_deepseek, deepseek_api_key):
+def _run_transcription_job(job_id, source_paths, model_size, language, use_deepseek, deepseek_api_key):
     """在后台线程中执行转写，进度写入 JobManager。
 
-    video_paths 为已复制到应用临时目录的本地路径列表（由 start_upload 在请求存活期内完成复制），
-    避免 Gradio 在前端请求结束后清理临时文件导致后台线程读不到。
+    source_paths 是 Gradio File 组件上传后返回的原始临时文件路径。
+    后台线程启动后会立刻把它们复制到应用自己的 TEMP_DIR，然后再加载模型/转写，
+    这样既能避免 Gradio 在请求结束后清理临时文件，又不会阻塞主线程响应 healthcheck。
     """
     results = []
+    local_paths: list[str] = []
 
     def update_progress(step, total, desc, done=False):
         job_manager.update(
@@ -281,10 +253,40 @@ def _run_transcription_job(job_id, video_paths, model_size, language, use_deepse
         )
 
     try:
-        if not video_paths:
+        if not source_paths:
             update_progress(0, 1, "请上传至少一个视频文件", done=True)
             job_manager.set_done(job_id, [])
             return
+
+        # 第一步：立即把 Gradio 临时文件复制到应用本地目录。
+        # 必须抢在模型加载之前完成，避免 Gradio 清理临时文件后读不到。
+        update_progress(0, max(len(source_paths), 1), "正在安全复制上传文件...")
+        copy_errors = []
+        for i, src in enumerate(source_paths):
+            try:
+                if not os.path.exists(src):
+                    raise FileNotFoundError(f"上传文件不存在: {src}")
+                dest = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{Path(src).name}")
+                _copy_file_chunked(src, dest)
+                local_paths.append(dest)
+                print(f"[COPY] {i+1}/{len(source_paths)} {Path(src).name} -> {dest}")
+            except Exception as e:
+                print(f"[ERROR] 复制上传文件失败 {src}: {e}")
+                traceback.print_exc()
+                copy_errors.append(f"{Path(src).name}: {e}")
+
+        if copy_errors:
+            err_msg = "部分文件复制失败：" + "；".join(copy_errors)
+            update_progress(0, 1, f"❌ {err_msg}", done=True)
+            job_manager.set_done(job_id, [], error=err_msg)
+            return
+
+        if not local_paths:
+            update_progress(0, 1, "❌ 没有可用的本地文件", done=True)
+            job_manager.set_done(job_id, [], error="没有可用的本地文件")
+            return
+
+        video_paths = local_paths
 
         need_reload = (state.model_size != model_size or state.language != language)
         state.model_size = model_size
@@ -394,44 +396,40 @@ def _run_transcription_job(job_id, video_paths, model_size, language, use_deepse
                 pass
 
 
-def start_upload(file_items, model_size, language, use_deepseek, deepseek_api_key):
+def start_upload(source_paths, model_size, language, use_deepseek, deepseek_api_key):
     """启动后台转写任务。
 
-    file_items 由 on_files_change 在文件上传完成时生成，每项包含：
-      - orig: Gradio 临时文件原始路径
-      - copy: 已复制到 TEMP_DIR 的本地副本路径
-
-    直接使用副本路径启动后台线程，避免请求生命周期结束后 Gradio 清理临时文件。
+    source_paths 是 Gradio File 组件上传后返回的原始临时文件路径列表，
+    由 on_files_change 在文件上传完成时记录到 uploaded_files_state。
+    后台线程会第一时间把它们复制到应用本地目录，再开始加载模型/转写。
     """
     job_id = job_manager.create()
 
-    video_paths = []
-    missing = []
-    for item in file_items or []:
-        copy_path = item.get("copy")
-        if copy_path and os.path.exists(copy_path):
-            video_paths.append(copy_path)
-        else:
-            missing.append(Path(item.get("orig", "未知文件")).name)
-
-    if missing:
-        err_msg = f"以下文件未找到本地副本，请重新上传：{', '.join(missing)}"
+    if not source_paths:
+        err_msg = "请上传至少一个视频文件"
         job_manager.set_done(job_id, [], error=err_msg)
-        progress_html = _progress_html(0, 1, err_msg, done=True)
-        return job_id, progress_html
+        return job_id, _progress_html(0, 1, err_msg, done=True)
 
-    if not video_paths:
+    # 过滤掉不存在的路径（理论上不会发生，但做一层防御）
+    valid_paths = [p for p in source_paths if isinstance(p, str) and p.strip()]
+    missing_names = [Path(p).name for p in source_paths if p and not os.path.exists(p)]
+    if missing_names:
+        err_msg = f"以下文件未找到，请重新上传：{', '.join(missing_names)}"
+        job_manager.set_done(job_id, [], error=err_msg)
+        return job_id, _progress_html(0, 1, err_msg, done=True)
+
+    if not valid_paths:
         err_msg = "请上传至少一个视频文件"
         job_manager.set_done(job_id, [], error=err_msg)
         return job_id, _progress_html(0, 1, err_msg, done=True)
 
     thread = threading.Thread(
         target=_run_transcription_job,
-        args=(job_id, video_paths, model_size, language, use_deepseek, deepseek_api_key),
+        args=(job_id, valid_paths, model_size, language, use_deepseek, deepseek_api_key),
         daemon=True,
     )
     thread.start()
-    return job_id, _progress_html(0, 1, "🚀 任务已启动，正在准备...")
+    return job_id, _progress_html(0, 1, "🚀 任务已启动，正在安全复制上传文件...")
 
 
 def check_status(job_id):

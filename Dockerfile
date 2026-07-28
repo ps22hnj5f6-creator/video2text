@@ -28,7 +28,8 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('base', dev
 COPY . .
 
 # === 健康检查（Sealos 自动检测容器状态）===
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+# 延长 start-period 和 interval，避免上传复制等阻塞主线程时误判为不健康
+HEALTHCHECK --interval=60s --timeout=30s --start-period=120s --retries=5 \
     CMD curl -f http://localhost:7860/ || exit 1
 
 EXPOSE 7860
