@@ -11,6 +11,8 @@ import tempfile
 import threading
 from pathlib import Path
 
+from fastapi.responses import JSONResponse, PlainTextResponse
+
 # HuggingFace 国内镜像（解决 SSL/被墙问题）
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
@@ -985,6 +987,11 @@ def build_app():
                     file_types=[".mp4", ".mov", ".avi", ".webm", ".mkv", ".flv", ".3gp"],
                     type="filepath"
                 )
+                gr.Markdown(
+                    f"<p style='margin:-8px 0 8px 0; color:#888; font-size:12px;'>"
+                    f"单次上传总大小建议不超过 {MAX_UPLOAD_TOTAL_MB} MB；"
+                    f"若平台/网关限制更小，请分批上传或压缩视频。</p>"
+                )
                 # 上传进度/就绪状态（File 组件上传完成后 change 事件更新）
                 upload_progress = gr.HTML(
                     value=_upload_progress_html(0, 0),
@@ -1079,6 +1086,16 @@ def build_app():
             fn=lambda: ("", gr.update(active=False)),
             outputs=[job_id_state, timer]
         )
+
+    # 独立健康检查端点：不经过 Gradio Blocks 处理，避免大文件上传阻塞主线程时
+    # Sealos/k8s 健康检查拿不到响应而误判容器不健康、重启 Pod。
+    @app.app.get("/health")
+    async def health_check():
+        return JSONResponse({"status": "ok", "timestamp": time.time()})
+
+    @app.app.get("/healthz")
+    async def healthz_check():
+        return PlainTextResponse("ok")
 
     return app
 
