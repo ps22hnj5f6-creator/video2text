@@ -11,6 +11,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 # HuggingFace 国内镜像（解决 SSL/被墙问题）
@@ -51,48 +52,103 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # ========== 后台任务管理（避免 WebSocket 被网关切断） ==========
 
 class JobManager:
-    """线程安全的后台任务管理器"""
+    """线程安全、支持多 worker 共享的后台任务管理器。
+
+    任务状态同时保存在内存和磁盘 JSON 文件中，供 Gunicorn 多 worker 共享。
+    每个 worker 进程内的后台线程更新本地内存后，会同步写入磁盘；
+    其他 worker 的轮询请求可以从磁盘读取最新状态。
+    """
     def __init__(self, max_jobs: int = 50):
         self._lock = threading.Lock()
         self._jobs: dict[str, dict] = {}
         self._max_jobs = max_jobs
+        # 持久化目录：所有 worker 进程共享，使用 /tmp 避免容器内权限问题
+        self._persist_dir = os.path.join(TEMP_DIR, "jobs")
+        os.makedirs(self._persist_dir, exist_ok=True)
+
+    def _job_file(self, job_id: str) -> str:
+        return os.path.join(self._persist_dir, f"{job_id}.json")
+
+    def _persist(self, job_id: str, job: dict):
+        """把任务状态持久化到磁盘（带进程锁，供多 worker 安全读写）"""
+        path = self._job_file(job_id)
+        tmp_path = path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(job, f, ensure_ascii=False, default=str)
+            os.replace(tmp_path, path)
+        except Exception:
+            traceback.print_exc()
+
+    def _load_from_disk(self, job_id: str) -> dict | None:
+        """从磁盘读取任务状态"""
+        path = self._job_file(job_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
 
     def create(self) -> str:
         job_id = str(uuid.uuid4())
+        job = {
+            "created_at": time.time(),
+            "status": "pending",
+            "step": 0,
+            "total": 1,
+            "desc": "等待开始...",
+            "results": [],
+            "done": False,
+            "error": None,
+            "rendered": False,
+        }
         with self._lock:
             if len(self._jobs) > self._max_jobs:
                 self._cleanup()
-            self._jobs[job_id] = {
-                "created_at": time.time(),
-                "status": "pending",
-                "step": 0,
-                "total": 1,
-                "desc": "等待开始...",
-                "results": [],
-                "done": False,
-                "error": None,
-            }
+            self._jobs[job_id] = job
+        self._persist(job_id, job)
         return job_id
 
     def update(self, job_id: str, **kwargs):
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is not None:
-                job.update(kwargs)
+            if job is None:
+                # 本进程没有，尝试从磁盘加载（多 worker 场景）
+                job = self._load_from_disk(job_id)
+                if job is None:
+                    return
+                self._jobs[job_id] = job
+            job.update(kwargs)
+            self._persist(job_id, job)
 
     def get(self, job_id: str) -> dict | None:
         with self._lock:
             job = self._jobs.get(job_id)
-            return job.copy() if job else None
+            if job is not None:
+                return job.copy()
+        # 多 worker 场景：本进程没有，从磁盘读取
+        job = self._load_from_disk(job_id)
+        if job is not None:
+            with self._lock:
+                self._jobs[job_id] = job
+            return job.copy()
+        return None
 
     def set_done(self, job_id: str, results: list, error: str | None = None):
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is not None:
-                job["results"] = results
-                job["error"] = error
-                job["done"] = True
-                job["status"] = "error" if error else "done"
+            if job is None:
+                job = self._load_from_disk(job_id)
+                if job is None:
+                    return
+                self._jobs[job_id] = job
+            job["results"] = results
+            job["error"] = error
+            job["done"] = True
+            job["status"] = "error" if error else "done"
+            self._persist(job_id, job)
 
     def _cleanup(self):
         """清理超过 2 小时的旧任务"""
@@ -100,6 +156,10 @@ class JobManager:
         expired = [jid for jid, job in self._jobs.items() if now - job["created_at"] > 7200]
         for jid in expired:
             self._jobs.pop(jid, None)
+            try:
+                os.unlink(self._job_file(jid))
+            except OSError:
+                pass
 
 
 job_manager = JobManager()
@@ -1087,23 +1147,31 @@ def build_app():
             outputs=[job_id_state, timer]
         )
 
-    # 独立健康检查端点：不经过 Gradio Blocks 处理，避免大文件上传阻塞主线程时
-    # Sealos/k8s 健康检查拿不到响应而误判容器不健康、重启 Pod。
-    @app.app.get("/health")
-    async def health_check():
-        return JSONResponse({"status": "ok", "timestamp": time.time()})
-
-    @app.app.get("/healthz")
-    async def healthz_check():
-        return PlainTextResponse("ok")
-
     return app
 
 
 # ========== 启动 ==========
 
+# 模块级暴露 Gradio Blocks 对象，本地开发直接 python app.py 时使用
+app = build_app()
+
+# 模块级暴露 ASGI app，供 Gunicorn/Uvicorn 多 worker 启动使用。
+# 用 FastAPI 作为外层应用，先注册 /health 等独立端点，再通过 mount_gradio_app
+# 把 Gradio 挂到根路径。这样 Gradio 会被正确初始化（config/body_css 等），
+# 同时健康检查端点不经过 Gradio Blocks，上传大文件时仍能快速响应。
+asgi_app = FastAPI()
+
+@asgi_app.get("/health")
+async def health_check():
+    return JSONResponse({"status": "ok", "timestamp": time.time()})
+
+@asgi_app.get("/healthz")
+async def healthz_check():
+    return PlainTextResponse("ok")
+
+asgi_app = gr.mount_gradio_app(asgi_app, app, path="/")
+
 if __name__ == "__main__":
-    app = build_app()
     # 注意：不使用 queue()/WebSocket，避免 Sealos 等网关不支持 WebSocket 导致 503
     # 转写改为后台线程 + gr.Timer 轮询，所有请求均为短 HTTP
     app.launch(

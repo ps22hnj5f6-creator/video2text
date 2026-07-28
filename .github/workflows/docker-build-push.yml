@@ -64,7 +64,7 @@ jobs:
             "$IMAGE"
           BOOTED=false
           for i in $(seq 1 40); do
-            if curl -fsS http://localhost:7860/ >/dev/null 2>&1; then
+            if curl -fsS http://localhost:7860/health >/dev/null 2>&1; then
               BOOTED=true
               echo "APP_BOOTED_OK after ${i} tries"
               break
@@ -78,5 +78,6 @@ jobs:
             docker rm -f v2t-smoke || true
             exit 1
           fi
+          curl -fsS http://localhost:7860/health | grep -o '"status":"ok"' && echo "HEALTH_OK" || echo "HEALTH_MISSING"
           curl -fsS http://localhost:7860/ | grep -o "短视频批量转文字" && echo "TITLE_FOUND" || echo "TITLE_MISSING"
           docker rm -f v2t-smoke || true

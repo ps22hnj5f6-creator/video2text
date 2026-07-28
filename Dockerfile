@@ -39,4 +39,9 @@ EXPOSE 7860
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV GRADIO_SERVER_PORT=7860
 
-CMD ["python", "app.py"]
+# 使用 Gunicorn + Uvicorn worker 启动 2 个 worker：
+# 大文件上传会占满一个 worker 的 Gradio 主线程，另一个 worker 仍可响应健康检查，
+# 避免 Sealos 默认探针因 / 响应超时而重启 Pod。
+# --timeout 120: 允许后台转写任务运行较长时间
+# --keep-alive 5: 保持连接，减少网关短连接开销
+CMD ["gunicorn", "app:asgi_app", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:7860", "--timeout", "120", "--keep-alive", "5"]
